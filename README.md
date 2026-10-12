@@ -36,6 +36,8 @@ See [`deployment/README.md`](deployment/README.md) for parameterized L1/L2 deplo
 
 ## Documentation
 
+Start with the [EEZ walkthrough](docs/EEZ_WALKTHROUGH.md) for the execution model, a complete call example and a source/test reading guide.
+
 [`CLAUDE.md`](CLAUDE.md) is a condensed architecture reference (contracts, data types, key functions, execution flow, naming conventions). For depth:
 
 - [`docs/CORE_PROTOCOL_SPEC.md`](docs/CORE_PROTOCOL_SPEC.md) — formal protocol specification

@@ -318,7 +318,8 @@ _expects_missing_proxy_rejection() {
 _check_missing_proxy_rejection() {  # chain, hash, evidence file
     local chain="$1" hash="$2" evidence="$3" details rpc receipt direct
     [[ "$chain" == L1 || "$chain" == L2 ]] || return 1
-    details=$(cast rpc --rpc-timeout 10 --rpc-url "$L2_RPC" eez_getCrossChainTransaction "$hash" 2>/dev/null) || return 1
+    rpc=$(_front_rpc "$chain")
+    details=$(cast rpc --rpc-timeout 10 --rpc-url "$rpc" eez_getCrossChainTransaction "$hash" 2>/dev/null) || return 1
     printf '%s\n' "$details" > "$evidence" || return 1
     jq -e --arg hash "$hash" '
         .hash == $hash and .lifecycle == "terminal" and
@@ -714,6 +715,7 @@ verify_phase() {
 
     echo ""
     echo "== Verify phase ($VERIFY_PARALLEL parallel) — logs in $RUN_DIR/jobs/<job>/verify.log"
+    [[ "${SKIP_VERIFIED:-0}" != 1 ]] || echo "NOTE: revalidating previously passed jobs against current canonical inclusions"
     # Pre-read the job list: the loop spawns children, which must not inherit
     # (and drain) the csv on stdin.
     local JOBS_ROWS=()
@@ -739,10 +741,6 @@ verify_phase() {
             PRE_FAILED+=("$name (nothing sent)"); continue
         elif (( sent_n < ${want_n:-1} )); then   # a send failure mid-job is an orchestration failure, not a protocol one
             PRE_FAILED+=("$name (partial send: $sent_n of ${want_n:-1} trigger tx(s) went out - see send-failed.log)"); continue
-        elif ! _expects_missing_proxy_rejection "$sol" && [[ -f "$RUN_DIR/pending.csv" ]] && grep -q "^$name," "$RUN_DIR/pending.csv"; then
-            PRE_FAILED+=("$name (trigger tx never mined - see pending.csv)"); continue
-        elif ! _expects_missing_proxy_rejection "$sol" && [[ "${SKIP_VERIFIED:-0}" == "1" ]] && grep -q "^====== Done ======" "$dir/verify.log" 2>/dev/null; then
-            SKIPPED_OK=$((SKIPPED_OK+1)); continue   # already passed in an earlier verify pass
         fi
         while (( $(jobs -rp | wc -l) >= VERIFY_PARALLEL )); do sleep 2; done
         echo "VERIFY $name (manifest v$(_manifest_version "$dir/manifest.env"))"

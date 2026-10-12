@@ -11,6 +11,7 @@ chain.env*
 
 gh_issue
 node_modules
+trace-decoder
 
 tmp*
 gas-report/

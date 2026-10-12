@@ -29,6 +29,7 @@ import {
     noCalls,
     expectedL1toL2Hash,
     RollingHashBuilder,
+    HashStep,
     immediateSingleRollupBatch
 } from "../../../shared/E2EHelpers.sol";
 
@@ -74,6 +75,16 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract ReentrantActions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    function _l1Steps(address rcL1, address rcL2) internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](4);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_cchSub1(rcL1, rcL2));
+        steps[0][1] = RollingHashBuilder.stepNestedBegin(_cchReentry0(rcL2, rcL1));
+        steps[0][2] = RollingHashBuilder.stepNestedEnd();
+        steps[0][3] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+    }
+
     // ── calldata ──
 
     function _dc(uint256 n) internal pure returns (bytes memory) {
@@ -405,6 +416,7 @@ contract ComputeExpected is ComputeExpectedBase, ReentrantActions {
         console.log("EXPECTED_L2_HASHES=[%s]", vm.toString(l2Hash));
         _printL1CallHashes(l1);
         _printL2CallHashes(l2);
+        _printL1Steps(l1, _l1Steps(rcL1Addr, rcL2Addr));
         _printL1Table(l1);
         _printL2Table(l2);
         console.log("");

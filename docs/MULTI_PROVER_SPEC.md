@@ -26,7 +26,7 @@ accepted verifiers, verification keys and threshold.
 | `src/interfaces/IEEZL2.sol` | L2 execution structs with self-relative directional names (`CrossChainCall`, `ExpectedOutgoingCrossChainCall`, `ExecutionEntry`, `StaticExecutionEntryL2`) — leaner than L1's (no `RollupUpdate` / `destinationRollupId` / `ExpectedRootPerRollup`) |
 | `src/interfaces/IMetaCrossChainReceiver.sol` | Callback fired on `postAndVerifyBatch`'s sender to drive the transient stream |
 | `src/base/CrossChainProxy.sol` | CREATE2-deployed proxy per (originalAddress, originalRollupId); immutable `EEZ` points at the manager |
-| `src/base/ExpectedL1ToL2CallTransient.sol` | EIP-1153 transient-storage implementation for the immediate L1→L2 reentrant table; inherited by `EEZ` and used while immediate entries execute |
+| `src/base/ExpectedL1ToL2CallTransient.sol` | EIP-1153 transient-storage implementation for the expected reentrant-call table of the leading inline L2Tx entry currently executing; meta-hook and deferred entries use their stored tables |
 
 ## Multi-prover model
 
@@ -52,7 +52,7 @@ struct ProofSystemBatchPerVerificationEntries {
 
 struct RollupIdWithProofSystems {
     uint64 rollupId;
-    uint64[] proofSystemIndexes;  // indices into proofSystems[], strictly ascending; len >= rollup's threshold
+    uint64[] proofSystemIndexes;  // indices into proofSystems[], strictly ascending; nonempty; reference manager additionally requires len >= threshold
 }
 
 struct ExpectedRootPerRollup {
@@ -67,15 +67,15 @@ the global list — and all proofs must verify atomically (one revert reverts th
 **Per-rollup PS subset (explicit):** each rollup `R` lists `proofSystemIndexes[]` —
 strictly-ascending indices into the batch's `proofSystems[]`. The rollup's manager is
 handed the resolved subset via `IRollupContract.checkProofSystemsAndGetVkeys(subset)` and
-enforces (a) every PS is known with a non-zero vkey for `R`, (b) `subset.length >= threshold`.
+applies its own policy. The reference Rollup enforces (a) every PS is known with a non-zero vkey for `R`, (b) `subset.length >= threshold`. EEZ independently requires a nonempty subset even if the reference threshold is zero.
 The registry never reads `threshold` separately — single external call per rollup. The registry
 additionally requires the manager to return exactly one vkey per subset entry
-(`InvalidProofSystemConfig` otherwise).
+(`InvalidProofSystemConfig` otherwise). Every globally listed proof system is verified, including one selected by no rollup; its per-system rollup/key accumulator remains zero.
 
 **Composer root pins:** `expectedRootPerRollup` is an optional set of assertions
 checked before anything else — each pin must equal the live `rollups[rid].root` or the
 whole call reverts `ExpectedRootMismatch(rid)`. Lets a batch composer refuse to land on
-an unexpected state.
+an unexpected state. These batch-level assertions are not folded into the public input; the root fields inside each full entry are.
 
 **Unproven dispatch params:** `immediateEntryCount` / `immediateStaticEntryCount` are NOT
 folded into the public input, so the immediate/persistent split can be re-tuned without
@@ -185,8 +185,11 @@ consumers gate on `lastVerifiedBlock == block.number`. Appends overwrite retaine
 - `_consumeNestedCall` / reentrant static reads: resolved from the executing entry's own
   unified `expectedL1ToL2Calls[]` table (entry-scoped — no queue routing at all), each entry
   content-addressed by `expectedL1toL2Hash == keccak256(crossChainCallHash, _rollingHash)`.
-  A mutable reentrant no-match folds `CALL_NOT_FOUND` into the rolling hash so the entry
-  fails its final `RollingHashMismatch` check. Static lookup retries candidates whose
+  A mutable reentrant no-match folds `CALL_NOT_FOUND` into the rolling hash and returns
+  success with empty bytes. Against an honest expected hash, a marker that survives to
+  validation causes `RollingHashMismatch`; an ordinary enclosing revert can erase it.
+  `ContextResult` preserves the hash across an explicit rollback span. See the
+  [reverted-probe caveat](CAVEATS.md#edge-cases). Static lookup retries candidates whose
   callback-result hashes mismatch, without advancing a cursor; exhaustion instead
   reverts `ExecutionNotFound`. Same-key alternatives support local writes between reads
   ([STATIC_ENTRY §4.4](STATIC_ENTRY.md#44-local-writes-between-identical-static-reads)).
@@ -205,11 +208,12 @@ The transient stream is consumed via the global `_transientEntryIndex` cursor (w
 forward-scan matching as the persistent path).
 
 After the transient stream drains (or doesn't), the persistent remainder is published to
-per-rollup queues unconditionally. Soundness backstop: each entry's `RollupUpdate.currentRoot`
-is part of the match predicate at consumption time; entries whose preconditions don't match
-the on-chain state are simply never matched (`ExecutionNotFound` if nothing else matches).
-So dropped transient leftover doesn't poison persistent consumers — they just fail their own
-root match if they depended on it.
+per-rollup queues unconditionally. Each entry's `RollupUpdate.currentRoot` is checked at
+consumption; entries whose required rollup roots do not match are skipped
+(`ExecutionNotFound` if nothing else matches). A later entry is blocked if a skipped
+transition leaves a required rollup root unmatched. Dependencies on other L1 state need
+their own checks. L1 determines settlement order across deferred rollup queues; the
+proven batch's array order does not impose it.
 
 ---
 
@@ -227,8 +231,9 @@ root match if they depended on it.
    (strictly increasing, all ∈ batch), `destinationRollupId` ∈ its own deltas, every call
    SOURCE ∈ its deltas (top-level + reentrant sub-calls); per static entry: `expectedRoots`
    pins strictly increasing and ∈ batch, `destinationRollupId` pinned, sub-call sources pinned;
-   immediate prefix bounds, and `ImmediateCountStrandsLeadingL2Tx` (the poster may not truncate
-   `immediateEntryCount` below the leading L2Tx run).
+   L2Tx canonicality (`success == true`, empty `returnData`), immediate prefix bounds,
+   and `ImmediateCountStrandsLeadingL2Tx`: the first deferred entry, if any, cannot have
+   zero `proxyEntryHash`, even when the boundary follows proxy entries.
 4. **Fetch vkeys + verify**: `_getVerificationKeysPerRollup(batch)` calls each rollup's manager
    via `IRollupContract.checkProofSystemsAndGetVkeys(subset)` — manager enforces threshold and
    returns one vkey per PS in the subset (length-checked by the registry). Then

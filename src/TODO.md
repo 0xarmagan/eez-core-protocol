@@ -1,39 +1,54 @@
 # TODO
 
+## Follow-up reviews
+
+- [ ] **Experiment with mutable retries and decide whether to implement them.**
+      Not implemented; implementation is undecided. Keep the current support limitation in
+      [Caveats](../docs/CAVEATS.md#delivery-and-execution-semantics). Use the
+      [call-pattern analysis and checklist](../docs/CALL_PATTERN_LIMITS.md) to evaluate
+      top-level and nested L1/L2 retries, successful calls undone by a parent revert,
+      stale nested answers, rejected candidates' state/value rollback, valid application
+      reverts and gas/search costs. If implementation is chosen, validate these cases
+      before claiming support; experiments alone do not resolve the limitation.
+
 ## Gas
 
-- [ ] **Meta-hook entries through the transient serializer.** `_transientEntries` /
+- [ ] **Meta-hook entries through the transient serializer instead of storage.** `_transientEntries` /
       `_transientStaticEntries` go to storage and back within one tx. Extend
-      `ExpectedL1ToL2CallTransient` to whole entries and point the four read
-      sites at it. Same for L2 `executeIncomingCrossChainCall` (`loadExecutionTable` stays storage).
+      `ExpectedL1ToL2CallTransient` to whole entries and update the execution/static lookup
+      sites. Evaluate L2 `executeIncomingCrossChainCall` separately: later entries and
+      static rows must remain available to follow-up transactions in the load block,
+      so an entirely transient replacement would change current behavior.
       Benchmark the savings per meta-hook batch against inline execution.
-- [ ] **Look up reentrant rows without copying the whole table.** Every nested call copies
+- [ ] **Look up L1 reentrant rows without copying the whole table in memory.** L1 nested lookup copies
       `expectedL1ToL2Calls` to memory before scanning. Scan the keys in place and copy only the match
       (nested CALL and STATICCALL; immediate, meta-hook and persistent tables — transient rows are
       already key-addressable). Keep cursor/rollback and empty-table behavior; no ABI, proof or
-      storage-layout change. Benchmark deep nesting (copying is quadratic today), gas and bytecode.
+      storage-layout change. L2 already scans its expected-call table in storage. Benchmark how L1 copying
+      scales with lookup count and total table size, along with gas and bytecode.
       Do after the item above.
+
+- [ ] **Budget L2-to-L1 calls and return-data processing.** Measure total per-entry
+      gas and memory: call count, calldata, proxy creation/forwarding, nested callbacks,
+      and copying/hashing returned values or revert messages. Include candidate attempts
+      when measuring execution costs and cover the corresponding L2 incoming-call paths.
+      Define supported size/gas budgets; any limits must agree with proof/execution rules.
+      No fixed on-chain limits are selected. Event-log measurements are tracked separately below.
 
 ## Benchmarks
 
 - [ ] **Benchmark execution log payloads (L1/L2).** Events carry full return data; L2 also logs the
-      whole loaded table. Set payload budgets; use hashes/IDs where full data is unnecessary.
-
-## Observability
-
-- [ ] **Identify execution events clearly.** Immediate entries report index zero, nested call
-      indices repeat, and `BatchPosted` carries a shared public-input hash and rollup IDs. Consider batch IDs, real entry
-      indices and frame IDs, and distinguish proof acceptance, committed execution, deliberate
-      rollback and omitted work. Reverted frames erase their own logs, so keep the surviving
-      rollback-summary events distinct from committed target calls.
+      whole loaded table. Measure payload size and gas for the current event interface.
 
 ## Bytecode
 
-EEZ runtime 23,857 B of the 24,576 B EIP-170 limit (719 B headroom); EEZL2 13,932 B.
-EEZ creation bytecode is 25,533 B, below the 49,152 B initcode limit. The compiler is tuned for size
+The current local artifacts report EEZ runtime 23,942 B of the 24,576 B EIP-170 limit
+(634 B headroom) and EEZL2 runtime 14,017 B. EEZ creation bytecode is 25,618 B
+before constructor arguments, below the 49,152 B initcode limit. The compiler is tuned for size
 (`optimizer_runs = 1`, via-IR), so savings need config or source changes.
 
-Remeasure the per-region figures below before estimating savings for the current build.
+The per-region figures below are historical estimates, not a breakdown of the current
+artifacts. Remeasure them before estimating savings for the current build.
 Regions share helpers, so the deltas overlap:
 
 | Region | Bytes |

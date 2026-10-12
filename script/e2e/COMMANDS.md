@@ -45,10 +45,11 @@ export DEVNET_ENV=chain.env2
 
 ## Build the artifacts first
 
-Every runner starts with a `forge build`; with `via_ir = true` a **cold** build
-takes ~3 minutes and the staged runner prints nothing else meanwhile (it shows
-`== forge build (warming artifacts…)`), so run it yourself once to see the
-compiler output and skip the wait inside the run:
+The staged, parallel-network and load runners build artifacts before their
+parallel work. Other workers compile as needed through `forge script`. With
+`via_ir = true`, a cold build can take several minutes; the staged runner prints
+a warming-artifacts message while suppressing build output. Build once yourself
+to see compiler output before launching a suite:
 
 ```bash
 forge build
@@ -59,8 +60,8 @@ Why it goes cold: `forge script <file>:<Contract>` rewrites
 after any run's parallel forge phases the next `forge build` recompiles the rest.
 `staged.sh` guards against this (it keeps the warm cache from its first
 build and restores it before every forge phase and on exit — back-to-back
-staged runs build in well under a second); `parallel.sh` /
-`sequential.sh` do not, so expect a cold build after those.
+staged runs can reuse it); the other runners do not provide that cache-restoration
+guarantee. Build times depend on the machine and which artifacts are warm.
 
 ## Big parallel load mix (770 jobs)
 
@@ -110,12 +111,12 @@ slowly, or again.
 
 ```bash
 
-## New network commands
+## Network commands
 bash script/e2e/run/network/staged.sh all:1
 PREPARE_PARALLEL=200 bash script/e2e/run/network/staged.sh --no-verify all:5
-bash script/e2e/run/network/load-testing.sh --workers 50 --txs-per-wallet 100 --window 10 Counter
+bash script/e2e/run/network/load-testing.sh --workers 50 --txs-per-wallet 100 --window 10 counter
 
-# The whole suite once (28 scenarios; ~2 min end to end, 28/28 on 2026-09-03)
+# Current automatic selection: 34 of 40 scenarios (six carry exclusion markers)
 bash script/e2e/run/network/staged.sh all:1
 
 # One scenario, or a few
@@ -129,7 +130,7 @@ DEVNET_ENV=chain.env2 PREPARE_PARALLEL=200 VERIFY_PARALLEL=30 MINE_TIMEOUT=60 ba
 # The 770-job load mix through the staged runner no verify
 PREPARE_PARALLEL=200 bash script/e2e/run/network/staged.sh --no-verify counter:100 counterL2:100 nestedCounter:50 nestedCounterL2:50 multi-call-nested:50 multi-call-nestedL2:50 multi-call-twice:50 multi-call-twiceL2:50 counter-multi-tx:50 reentrant:20 revertCounter:50 revertCounterL2:50 revertFromOtherChain:50 revertFromOtherChainL2:50
 
-# Every scenario x10 (260 jobs) — everything except bridge/bridgeL2 (see Caveats)
+# Selected 26-scenario mix x10 (260 jobs), excluding bridge/bridgeL2 (see Caveats)
 bash script/e2e/run/network/staged.sh counter:10 counterL2:10 counter-multi-tx:10 multi-call-twice:10 multi-call-twiceL2:10 multi-call-two-diff:10 multi-call-two-diffL2:10 multi-call-nested:10 multi-call-nestedL2:10 nestedCounter:10 nestedCounterL2:10 deepNested:10 flash-loan:10 reentrant:10 revertCounter:10 revertCounterL2:10 revertFromOtherChain:10 revertFromOtherChainL2:10 revertFromOtherChainAndCallAgainL2:10 revertFromOtherChainNested:10 nestedCallRevert:10 nestedCallRevertL2:10 topLevelStaticCounter:10 staticCounterL2:10 nestedStaticCounter:10 nestedStaticCounterL2:10
 
 # Send-only now, assess later at a gentle pace
@@ -138,7 +139,7 @@ VERIFY_PARALLEL=4 bash script/e2e/run/network/staged.sh --verify-only tmp/e2e-st
 
 # Big runs: pace the trigger sends (rate = workers / SEND_PAUSE tx/s). A burst of
 # ~280 triggers at once was accepted and then dropped by the fronts on 2026-09-03.
-SEND_PAUSE=0.5 bash script/e2e/run/network/staged.sh --workers 5 counter:10 counterL2:10 ...   # 10 tx/s
+SEND_PAUSE=0.5 bash script/e2e/run/network/staged.sh --workers 5 counter:10 counterL2:10   # 10 tx/s
 
 # Re-fire the triggers of a run the fronts dropped (accepted, never mined; nonces
 # still free): same pre-signed raw txs, old hashes archived as *.attempt<N>
@@ -214,9 +215,10 @@ it is killed and its job dropped, the run continues), `SEND_WORKERS=80`
 `DEPLOY_MINE_TIMEOUT=60`; funding flags/env are the same as
 `parallel.sh` (both source `orchestrator.sh`; the two chains are
 funded concurrently, every `fundUpTo` chunk fired at once and mined with one
-receipt pass). `counter-multi-tx` jobs can FAIL with a "composer split the
-triggers across blocks" NOTE when their triggers mine in different blocks — the
-known single-batch verifier limitation, not a protocol failure.
+receipt pass). Multi-trigger jobs can span several posting transactions: the
+network verifier unions mutable-entry matches and requires each expected index
+exactly once. Generic wrapper calldata and partial static-table matching remain
+unsupported; see [Verification TODO](README.md#verification-todo).
 
 Prepare runs in **plan mode** by default: after one batched nonce barrier
 (public RPC caught up with the fronts for every wallet) the orchestrator reads
@@ -250,8 +252,8 @@ v1 jobs whose deploys all mined but that never got a manifest — nothing is
 redeployed, a v2 manifest is trusted as written — then fires whatever is
 prepared and unsent (a multi-tx job whose send stopped part-way continues from
 the next raw tx); `--verify-only <run-dir>` re-syncs receipts (one batched
-re-poll) and (re)runs verification — `SKIP_VERIFIED=1` skips jobs whose
-verify.log already passed. Jobs the prepare phase dropped keep a
+re-poll) and (re)runs verification. Previously passed jobs are revalidated
+against current canonical inclusions; `SKIP_VERIFIED=1` no longer bypasses this. Jobs the prepare phase dropped keep a
 `.prepare-failed` marker so they stay in the fail count even on a truncated run.
 Verification shares a per-run settlement-calldata cache and prefilters
 candidate txs by the job's own contract addresses, so hundreds of parallel
@@ -275,25 +277,33 @@ baseline's last attempt.
 
 ## Settlement correlation RPC (`eez_getSettlementByL2Block` & co.)
 
-Composer/follower L2 nodes can expose the canonical L2-block ⇄ L1-settlement
-mapping. `network.sh` probes the L2 RPC once per verification
-(`eez_correlation_detect` in `E2EBase.sh`) and, when the method exists:
+Both Composer fronts expose settlement correlation. The runner probes
+`L2_FRONT`, then `L1_FRONT`; regular node RPCs do not serve these methods.
 
-- L2 trigger: `eez_getSettlementByL2Block(<receipt block>)` is polled until the
-  block is settled, then only that L1 block is verified and only the named
-  posting tx is calldata-decoded — no `[L1_BLOCK_BEFORE..latest]` scan, no
-  candidate sifting.
-- L1 trigger: `eez_getSettledL2RangesByL1Block(<settlement block>)` gives the
-  L2 range the batch proved; the composer puts every cross-chain system tx of a
-  batch in the LAST block of that range, so the L2 call scan starts at
-  `lastBlockNumber` instead of at the pre-trigger snapshot (upper bound stays
-  "latest").
+- Every trigger is looked up by transaction hash. Its receipt must identify a
+  successful transaction in the current canonical block.
+- L2 triggers use `eez_getSettlementByL2Block({"blockHash": receipt.blockHash})`.
+  L1 triggers use `eez_getSettledL2RangesByL1Block({"blockHash": receipt.blockHash})`.
+- Posting transaction hashes select calldata candidates. Existing table,
+  rolling-hash and execution-event checks remain mandatory.
+- Every matched posting contributes its exact L2 blocks. Multi-trigger jobs keep
+  all settlements and require complete, nonduplicated expected-entry coverage.
 
-Networks without the method (-32601 / no answer) keep today's range scans;
-`E2E_CORRELATION=off` forces them. Response field names are matched by shape
-(`_eez_pick`); an unrecognised shape is logged as
-`eez_…: unrecognised response shape: {…}` and falls back — pin the exact keys
-in `eez_settlement_by_l2_block` / `eez_l2_ranges_by_l1_block` once seen.
+Missing receipt indexes are retried across direct/front RPCs. When an exact block
+hint is available, `eth_getBlockReceipts(blockHash)` can recover the receipt by
+transaction hash. Receipt status and canonical block hash are still checked.
+Calldata may be cached by transaction hash; receipt block numbers are not cached.
+
+Before reporting a result, all observed block hashes are checked again.
+Changed or unavailable inclusion evidence discards the pass and refreshes the
+receipts and correlations. A semantic mismatch with unchanged canonical evidence
+remains a failure. Verification retries never submit transactions.
+
+`E2E_VERIFY_TIMEOUT` (default 600 seconds per job) bounds all verification passes,
+RPC requests and verifier processes together. Per-step timeouts are capped by
+that deadline. `-32001` (index catching up), missing results and transport failures
+remain retryable; malformed responses fail. Only `-32601` selects the compatibility
+content scans. `E2E_CORRELATION=off` explicitly selects those scans.
 
 ## Verify contracts from tx hashes
 
@@ -324,12 +334,14 @@ the commit that deployed the contract.
 
 ## Caveats
 
-- `bridge` / `bridgeL2` are excluded from the parallel mix: `bridgeL2` needs the
-  escrow `bridge` deposits (both default to 0.00001 ether), so run them
-  sequentially — `bash script/e2e/run/network/sequential.sh` covers the order.
+- The explicit load mixes above omit `bridge` / `bridgeL2`; automatic `all`
+  selection includes them. `bridgeL2` needs the escrow `bridge` deposits (both
+  default to 0.00001 ether). Establish that balance first, or run them in order:
+  `bash script/e2e/run/network/sequential.sh bridge bridgeL2`. The sequential
+  runner requires a selection; invoking it without arguments only prints usage.
 - Don't launch two orchestrator runs at once (`parallel.sh` OR
   `staged.sh` — they share the wallet pool): both take pool wallets from
-  the same index 0 and would race nonces. Check `pgrep -af network-` first (or use
+  the same index 0 and would race nonces. Check `pgrep -af 'script/e2e/run/network/(parallel|staged)\.sh'` first (or use
   `--fresh` for the second run). `--verify-only` is exempt — it sends nothing.
 - Logs land in `tmp/e2e-parallel-net/<timestamp>/<job>.log`; worker keys in
   `wallets.csv` in the same dir.

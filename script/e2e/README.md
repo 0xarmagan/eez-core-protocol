@@ -6,12 +6,13 @@ Categories: `one_way`, `multi_call`, `multi_tx`, `nested`, `reentrant`, `revert`
 
 The predeployed-proxy scenarios `topLevelStaticReentrantCounter` and
 `topLevelStaticReentrantCounterL2` are included in automatic `all` / default runs.
-Their live triggers remained unmined on 2026-10-05; the runner reports disappeared
-transactions in its final summary instead of excluding these scenarios.
+The staged runner reports disappeared transactions in its final summary; inclusion
+in `all` does not guarantee that a particular live deployment supports these scenarios.
 The missing-proxy variants `topLevelStaticReentrantMissingProxy` and
 `topLevelStaticReentrantMissingProxyL2` are expected-rejection tests in the
 **staged network runner**. They pass only when `eez_getCrossChainTransaction`
-on `L2_RPC` reports the matching hash as terminal with `SimulationFailed` and
+on the matching source-chain front (`L1_FRONT` or `L2_FRONT`) reports the matching
+hash as terminal with `SimulationFailed` and
 an exact `executor: static callback source proxy ... is not deployed on chain ...;
 it must exist before the read` error, and neither source nor front RPC has a
 receipt. Null responses, timeouts, other errors, and mined transactions do not
@@ -32,9 +33,11 @@ Two modes:
   posts the batch on L1 and loads the table on L2, and the runner verifies the
   on-chain result against locally computed expectations.
 
-**Encoding rule (both modes):** frame lifetime determines grouping. A completed
-top-level L1→L2 call has one L1 source entry and one L2 system delivery. One L2 user
-transaction has one zero-hash L1 L2Tx entry containing all its ordered L2→L1 calls,
+**Encoding rule (both modes):** frame lifetime determines grouping. A committed
+top-level mutable L1→L2 call has one L1 source entry and one L2 system delivery.
+L1→L2 static reads, calls that revert on L2, and calls erased by a source-frame
+revert are lookups without L2 delivery. One L2 user transaction has one zero-hash
+L1 L2Tx entry containing all its ordered L2→L1 calls,
 even though its L2 table has one source entry per proxy consumption. Calls made while
 a cross-chain frame remains open stay in that frame's nested tables/sub-arrays and
 never become later system deliveries.
@@ -59,7 +62,7 @@ script/
     run/network/    setup.sh, staged.sh, sequential.sh, parallel.sh, load-testing.sh
     run/local/      parallel.sh
     lib/            shared shell helpers, composer discovery, staged recovery
-    tests/          setup regression tests
+    tests/          network configuration, evidence, settlement and recovery regression tests
     COMMANDS.md     command examples
   tools/            block/trace decoding and explorer verification
   DeployBridge.s.sol  shared deployment utility used beyond E2E
@@ -78,7 +81,7 @@ Wallet pool, faucet, MultiSend cache and lock files remain in `script/e2e/run/`
 so existing funding identities and locks continue to be used. Run artifacts
 remain in their existing `tmp/` directories.
 
-Run the network configuration and setup regression tests with:
+Run the network runner regression tests with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s script/e2e/tests -v
@@ -86,13 +89,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s script/e2e/tests -v
 
 ## Prerequisites
 
-[Foundry](https://book.getfoundry.sh/getting-started/installation) (`forge`, `cast`),
-bash, `forge build` clean. Network mode also needs a test-only key (see step 1).
+[Foundry](https://book.getfoundry.sh/getting-started/installation) (`forge`, `cast`,
+and `anvil` for local mode), Bash, and a successful `forge build`. Network runners
+also use `curl`, `jq`, `bc`, `flock`, GNU `timeout`, and Python 3 for setup/regression
+helpers. Network mode needs a test-only key (see step 1).
 
 ## Local mode (no setup)
 
 ```bash
-bash script/e2e/run/local/parallel.sh              # everything
+bash script/e2e/run/local/parallel.sh              # default selection (34 scenarios; six explicitly excluded)
 bash script/e2e/run/local/parallel.sh one_way      # one category
 bash script/e2e/run/local/parallel.sh counter bridge
 ```
@@ -116,9 +121,9 @@ Staged runs save their resolved network in the run directory for later resume.
 
 ```bash
 L1_RPC=https://l1-rpc.example.net                     # L1 read/deploy RPC
-L1_FRONT=http://x.x.x.x:18999                         # L1→L2 triggers and composer metadata
+L1_FRONT=http://x.x.x.x:18999                         # L1→L2 triggers, composer metadata/status
 L2_RPC=http://x.x.x.x:18688                           # L2 read/deploy RPC
-L2_FRONT=http://x.x.x.x:18998                         # L2→L1 trigger txs ONLY
+L2_FRONT=http://x.x.x.x:18998                         # L2→L1 triggers and composer status
 PK=0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a  # private key to use in testing (example: anvil #2)
 ```
 
@@ -156,9 +161,8 @@ source script/e2e/lib/network-config.sh
 load_network_config
 ```
 
-The latest live checks on 2026-10-02 confirmed that both composer fronts in
-the checked environments answer `eez_composerInfo` with matching metadata
-within each environment. Discovery uses only `L1_FRONT`.
+Discovery uses only `L1_FRONT`; inspect the current response for the environment
+you are running against rather than relying on an earlier deployment snapshot.
 The response contains no endpoint URLs, keys, or EEZ rollup IDs. Ethereum chain
 IDs must not be used as EEZ rollup IDs (`L2_ROLLUP_ID` still defaults to 1).
 
@@ -206,13 +210,13 @@ links separate L1/L2 Bridges; L2 wrapped tokens still use CREATE2 internally.
 
 ### 4. Check the deployment is alive
 
-The active registry settles batches every few L1 blocks — a heartbeat. Zero logs =
-wrong `ROLLUPS` or dead composer (a stale deployment answers reads plausibly, but
-triggers hang forever):
+Inspect recent registry activity before sending a suite. Recent events confirm
+activity at that address; an empty window can also mean an idle composer and does
+not by itself prove that the address is wrong or the service is down:
 
 ```bash
 LATEST=$(cast block-number --rpc-url "$L1_RPC")
-cast logs --rpc-url "$L1_RPC" --from-block $((LATEST-100)) --to-block $LATEST --address "$ROLLUPS" | grep -c blockNumber   # >0 → active
+cast logs --rpc-url "$L1_RPC" --from-block $((LATEST-100)) --to-block $LATEST --address "$ROLLUPS" | grep -c blockNumber   # recent registry log count
 ```
 
 ### 5. Run — sequential set-runner
@@ -221,7 +225,7 @@ cast logs --rpc-url "$L1_RPC" --from-block $((LATEST-100)) --to-block $LATEST --
 bash script/e2e/run/network/sequential.sh one_way              # category
 bash script/e2e/run/network/sequential.sh counter              # single scenario
 bash script/e2e/run/network/sequential.sh counter bridge       # scenarios
-bash script/e2e/run/network/sequential.sh all                  # everything
+bash script/e2e/run/network/sequential.sh all                  # default selection (34 scenarios; six explicitly excluded)
 DEVNET_ENV=other.env bash script/e2e/run/network/sequential.sh one_way
 ```
 
@@ -235,8 +239,9 @@ any failure exits 1.
 
 ### 5b. Run — PARALLEL orchestrator (per-worker wallets)
 
-Every job gets its own ephemeral wallet, so scenarios run concurrently — including
-the same scenario N times (load testing):
+Every job gets a separate wallet from the persistent wallet pool, so scenarios run
+concurrently — including the same scenario N times. `--fresh` creates new wallets
+and appends them to the pool:
 
 ```bash
 bash script/e2e/run/network/parallel.sh counter:10            # counter 10x
@@ -246,9 +251,10 @@ bash script/e2e/run/network/parallel.sh one_way:2 nested      # categories too
 ```
 
 Self-funding: `faucet.txt` (in `script/e2e/run/`, gitignored) is the orchestrator's faucet —
-created on first run, topped up from anvil #2 when short; workers get `FUND_ETH`
-(default 0.001 ETH) per chain via MultiSend top-ups; a `flock` serializes
-concurrent instances.
+created on first run and topped up from `SOURCE_PK` (default Anvil #2) when short.
+Workers below `FLOOR_ETH` (default 0.0005 ETH) are topped up to `FUND_ETH`
+(default 0.001 ETH) per chain via MultiSend. A `flock` serializes funding; it does
+not reserve pool wallets for the duration of concurrent runs.
 
 Flags: `--direct` funds workers straight from the source key (anvil #2, or
 `SOURCE_PK`) with no faucet account; `--fund <eth>` sets the per-worker amount:
@@ -257,7 +263,7 @@ Flags: `--direct` funds workers straight from the source key (anvil #2, or
 bash script/e2e/run/network/parallel.sh --direct --fund 0.05 counter:10
 ```
 
-Env knobs: `MAX_PARALLEL` (default 100), `FUND_ETH`, `SOURCE_PK`,
+Env knobs: `MAX_PARALLEL` (default 100), `FUND_ETH`, `FLOOR_ETH`, `SOURCE_PK`,
 `RECEIPT_TIMEOUT`, `DEVNET_ENV`. Logs + worker keys:
 `tmp/e2e-parallel-net/<timestamp>/`.
 
@@ -265,11 +271,12 @@ Caveats:
 
 - **Memory is the ceiling** — ~20 concurrent jobs on a 32 GB machine; stacking runs
   can OOM-kill runners (logs cut off with no error text).
-- **Sibling batches** (L2-starting scenarios): a parallel job of the same scenario
-  can settle an event-identical entry first. The runner tries every candidate
-  settlement tx the range scan emitted (`L1_BATCH_TX_CANDIDATE`) and re-scans until
-  `L1_CALLDATA_TIMEOUT` (default 180 s for L2 triggers; 60 s for L1 triggers, whose
-  candidate set is known up front) before failing the posted-calldata check.
+- **Sibling batches:** repeated scenarios can have identical call hashes. With
+  Composer correlation, the runner restricts calldata candidates to the returned
+  posting transactions. Without correlation it uses range-scan candidates and
+  may rescan for eventless settlement discovery. `L1_CALLDATA_TIMEOUT` defaults
+  to 180 s for L2 triggers and 60 s for L1 triggers, capped by the overall
+  verification deadline.
 
 ### Run one scenario
 
@@ -283,15 +290,13 @@ MAX_PARALLEL=1 bash script/e2e/run/local/parallel.sh counter
 The runners call their internal workers in `lib/`; no separate public single-case
 command is needed. See [COMMANDS.md](COMMANDS.md) for more run examples.
 
-Timeouts (env, seconds): `RECEIPT_TIMEOUT` 300 (the set-runners raise it to 420).
-Verification fails fast where the protocol allows it: an L1 trigger's batch can only be
-in the trigger's own block (entries are consumable while `lastVerifiedBlock ==
-block.number`), so its block is retried for `L1_VERIFY_TIMEOUT` 30 and a range scan
-to the head for `L1_LATE_SETTLE_TIMEOUT` 30 only absorb RPC lag; an L2 trigger's
-settlement is genuinely asynchronous — `L1_SETTLE_TIMEOUT` 120. The L1→L2 delivery
-block is known from the settlement (correlation RPC): once the L2 head is past it the
-scan decides within `L2_KNOWN_BLOCK_TIMEOUT` 15; without correlation
-`L2_SETTLE_TIMEOUT` 180 bounds the scan.
+Timeouts (env, seconds): `RECEIPT_TIMEOUT` 300 (the set-runners raise it to 420)
+covers sending/initial mining. `E2E_VERIFY_TIMEOUT` 600 is one deadline per job for
+receipt refresh, settlement discovery, semantic verification and reorg retries.
+`L1_SETTLE_TIMEOUT` 120, `L1_CALLDATA_TIMEOUT` (60 for L1 triggers, 180 for L2),
+`L2_SETTLE_TIMEOUT` 180 and `VERIFY_NETWORK_TIMEOUT` 60 cap their individual steps
+within that deadline. Without correlation, `L2_ABSENT_GRACE` 60 retains the wait
+before checking that an expected-absent delivery left no evidence.
 
 ## Operational notes
 
@@ -310,35 +315,26 @@ bounded waits. Still your job:
 
 ## How L1 and L2 runs are correlated
 
-Batches carry no L2 block references on-chain, so the runner never links the two
-chains by block number. The link is **content**, in three layers:
+The runner refreshes trigger receipts by transaction hash and asks the Composer
+front for correlations using each receipt's **block hash**. The response supplies
+posting transaction hashes and exact L2 blocks; every trigger and matched
+settlement is retained, including jobs split across batches.
 
-1. **Call identity** — both chains compute the identical `crossChainCallHash`
-   preimage (`isStatic, source, sourceRollup, target, targetRollup, value,
-   callGas, data`), emitted indexed in L1's `ExecutionConsumed` and L2's
-   `CrossChainCallExecuted` / `IncomingCrossChainCallExecuted`.
-2. **Entry identity** — `keccak256(proxyEntryHash, rollingHash)`. The rolling hash
-   folds every call result (`returnData` included) and every nesting boundary, so
-   the source side's cached returns are cryptographically bound to the destination
-   side's actual execution — any divergence changes the hash and fails the run.
-   On L1 this identity is only computable where the seed's roots are known
-   (L2 tables, local mode); a live devnet settles real roots, so zero-hash L1
-   entries are instead pinned by posted-calldata **content** with roots neutralized
-   (the chain itself already verified the posted rolling hash against execution).
-3. **Time windows** — block-number snapshots taken right before publishing the
-   trigger bound every scan range (call hashes are not unique across runs — an
-   earlier run of the same scenario emits identical ones), and deadlines
-   (`L1_SETTLE_TIMEOUT`, `L2_SETTLE_TIMEOUT`, `L1_VERIFY_TIMEOUT`, `L1_LATE_SETTLE_TIMEOUT`,
-   `L2_KNOWN_BLOCK_TIMEOUT`, see "Manual single scenario") bound the wait.
+Correlation identifies candidates. Independent content checks still establish
+correctness: call identities, posted tables, rolling-hash replay with posted
+roots, return bytes and execution-event assertions. Eventless entries still
+require posted-calldata comparison.
 
-Concretely: the settlement block is discovered by scanning `[snapshot..latest]` —
-by expected call hashes on L1 proxy-consumed entries (`VerifyL1BatchInRange`), by
-listing persistent `BatchPosted` txs + calldata content-match for L1 zero-hash or
-eventless reverted entries (`VerifyL1SettlementTxsInRange`), by call hashes on L2
-(`VerifyL2CallsInRange`) —
-and the receipt block of the trigger tx is
-only ever a *candidate* — the composer may bundle the actual consumption in a
-later block on either chain.
+Receipt lookups try direct and front RPCs and can recover a missing transaction
+index through receipts for an exact known block. The runner retains block hashes,
+refreshes inclusion metadata, and rechecks the observed canonical blocks before
+reporting either success or a semantic failure. A changed inclusion restarts
+verification under the original deadline. A stable semantic mismatch fails.
+
+When the fronts do not support correlation (`-32601`), or
+`E2E_CORRELATION=off`, pre-trigger snapshots bound the existing content scans.
+Index catch-up and transport failures do not silently disable correlation.
+See [the RPC and retry flow](COMMANDS.md#settlement-correlation-rpc-eez_getsettlementbyl2block--co).
 
 ## What a network run verifies
 
@@ -355,22 +351,30 @@ there is no Python settlement collector.
 - **L1 posted batch** (when the scenario prints `EXPECTED_L1_TABLE`): the
   `postAndVerifyBatch` calldata is decoded and every
   expected entry is field-matched against a posted twin (calls, reentrant frames,
-  returnData, success flags; state updates: rollupId + etherDelta exact; the matched
-  entries' per-rollup update chain must be contiguous and move the root), plus the
-  structural invariants the contract itself enforces (proxy protection, immediate
-  prefix rules). The network runner fails if the required settlement transaction
+  returnData and success flags; state updates compare rollupId + etherDelta exactly).
+  Update-chain contiguity is required when the batch contains only matched entries;
+  interleaved foreign entries make a discontinuity a NOTE. No-op root rejection is
+  not a universal verifier check. Entry structure and immediate-prefix checks also
+  run. The network runner fails if the required settlement transaction
   cannot be identified. Local runs perform this comparison for all expected L1
   tables, including entries that have completion events.
-- **Rolling-hash replay** (when the scenario prints `EXPECTED_L1_STEPS` via
-  `_printL1Steps`): each posted entry's rolling hash must be reproduced by replaying
-  the scenario's recorded fold steps over the seed rebuilt from the POSTED state
-  roots — exact per-call verification (return data included) without predicting
-  roots. Without steps the comparison is content-only (a NOTE says so).
-- **Live roots**: the registry root must have settled to (or beyond) each
-  touched rollup's posted update.
-- **L2 table**: every expected entry must have a byte-identical loaded twin
+- **Rolling-hash replay**: all 36 scenarios that print `EXPECTED_L1_TABLE` also
+  export `EXPECTED_L1_STEPS` via `_printL1Steps`. Each matched posted entry's
+  rolling hash must be reproduced from scenario-defined call identities, outcomes,
+  return bytes and nesting boundaries, starting from the seed rebuilt from the
+  POSTED state roots. Seed-only entries export empty step sequences. Ordinary
+  reverts erase inner folds; deliberate rollback spans preserve their folds while
+  undoing state. The verifier retains a content-only fallback (with a NOTE) for
+  callers omitting steps; none of the current L1-table scenarios use it.
+- **Live roots**: the verifier checks the registry against posted update chains.
+  It can follow later updates within the decoded batch; advancement by separate
+  later posts in the same block remains a limitation listed below.
+- **L2 table**: every expected entry needs a distinct, byte-identical loaded twin
   (subset match — extra entries from other actors are ignored), plus structural
-  invariants.
+  invariants. Successful entries also need distinct completion evidence matching
+  the rolling hash and direct call count, with the reported nested cursor bounded
+  by the expected table length. Explicit `EVENTLESS_L2_HASHES` exemptions cover
+  entries whose enclosing frame rolls back; they do not prove that the attempt occurred.
 - **L2 calls**: `IncomingCrossChainCallExecuted` fields must re-hash to the emitted
   call hash and match the expected inbound call.
 
@@ -400,20 +404,22 @@ scenarios does not establish coverage of the deferred cases below.
   A completion from an earlier identical post can satisfy a later post's input
   check even if the later entry was unused. Add a negative test with two identical
   posts, only the first consumed, plus same-block queue replacement and disjoint queues.
-- [ ] Support posting through wrappers and combining one scenario's expected entries
-  across multiple posts. The current calldata verifier accepts direct
-  `postAndVerifyBatch` inputs and the local runner expects one candidate to contain
-  the full expected table. Cover multiple posts in one wrapper transaction,
-  reverted wrapper frames, and separate posting transactions. Choose the evidence
-  extraction design before adding a new tool or dependency.
+- [ ] Support generic wrapper calldata and multiple posts inside one transaction.
+  The current network runner accepts the `postAndVerifyBatch` selector on EEZ or
+  an `eez()`-bound batcher, and already unions mutable-entry matches across
+  multiple posting transactions for qualifying multi-trigger jobs. The local
+  runner still expects one candidate to contain the full table. Static tables
+  are checked in full per candidate, so partial static coverage is not supported.
+  Cover arbitrary wrapper selectors, multiple internal posts and reverted wrapper
+  frames before claiming general posting support.
 - [ ] Handle final-root checks when later posts in the same block advance a rollup.
   A candidate batch containing only the scenario's entries does not imply that it
   is the block's only batch. Preserve checks of the expected entry's own updates.
-- [ ] Add expected L1 hash-replay steps for the remaining scenarios with runtime calls.
-  Nineteen scenarios supplying an L1 table currently omit `EXPECTED_L1_STEPS`.
-  Local execution hashes are checked against the locally computed expectations;
-  network verification without steps cannot independently compare every expected
-  per-call runtime result after roots change. Do not substitute event counts for hashes.
+- [x] Export expected L1 hash-replay steps for every scenario supplying an L1 table:
+  **36 covered, 0 missing**. The scenario sources include seed-only, ordinary-revert
+  and deliberate-rollback steps. Runner regression coverage checks that nonempty
+  step blobs reach the verifier in both trigger directions. This source coverage
+  does not establish the status of a currently running devnet deployment.
 - [ ] Assert exact observed revert bytes and persisted caller evidence for eventless
   network scenarios. A table with `success=false` and no delivery logs does not
   establish that the intended attempt happened. A generic `lastCallFailed` flag
