@@ -39,6 +39,70 @@ network_rpc() {
     jq -e 'has("result")' <<< "$out" >/dev/null || return 1
     jq -c '.result' <<< "$out"
 }
+# Requests are bounded and identified independently; servers may reorder replies.
+network_batch_rpc() { # RPC, method, array of positional-parameter arrays -> ordered results
+    local rpc="$1" method="$2" params="$3" count offset chunk payload out results='[]' part left code item
+    count=$(jq -er 'if type=="array" then length else error("params must be an array") end' <<< "$params") || return 1
+    for ((offset=0; offset<count; offset+=100)); do
+        chunk=$(jq -c --argjson start "$offset" '.[$start:$start+100]' <<< "$params") || return 1
+        payload=$(jq -c --arg method "$method" 'to_entries|map({
+            jsonrpc:"2.0",id:(.key+1),method:$method,params:.value})' <<< "$chunk") || return 1
+        left=$(network_time_left) || return 4
+        (( left > 15 )) && left=15
+        out=$(printf '%s' "$payload" | curl -fsS --connect-timeout "$left" --max-time "$left" \
+            -H 'Content-Type: application/json' --data @- "$rpc" 2>/dev/null) || return 4
+        if jq -e 'type=="object" and .error.code==-32600' <<< "$out" >/dev/null 2>&1; then
+            # A transport that explicitly rejects batches can still serve ordinary RPCs.
+            part='[]'
+            while read -r item; do
+                item=$(network_rpc "$rpc" "$method" "$item") || return $?
+                part=$(printf '%s\n%s\n' "$part" "$item" | jq -cs '.[0]+[.[1]]') || return 1
+            done < <(jq -c '.[]' <<< "$chunk")
+        else
+            jq -e --argjson requests "$payload" 'type=="array" and
+                (map(.id)|sort)==($requests|map(.id)|sort) and
+                all(.[]; .jsonrpc=="2.0" and (has("result") or .error!=null))' \
+                <<< "$out" >/dev/null 2>&1 || return 1
+            if jq -e 'any(.[]; .error!=null)' <<< "$out" >/dev/null; then
+                code=$(jq -r '[.[]|select(.error!=null)|.error.code][0]' <<< "$out")
+                case "$code" in
+                    -32601) return 3 ;;
+                    -32001) return 2 ;;
+                    -32602) return 1 ;;
+                    *) return 4 ;;
+                esac
+            fi
+            part=$(jq -c 'sort_by(.id)|map(.result)' <<< "$out") || return 1
+        fi
+        # Keep response bodies on stdin when combining chunks, avoiding the
+        # shell's per-argument size limit.
+        results=$(printf '%s\n%s\n' "$results" "$part" | jq -cs 'add') || return 1
+    done
+    echo "$results"
+}
+network_headers() { # chain, array of [hex block number, false] -> validated headers
+    local chain="$1" params="$2" rpc headers number hash
+    [[ "$params" != '[]' ]] || { echo '[]'; return 0; }
+    while read -r rpc; do
+        headers=$(network_batch_rpc "$rpc" eth_getBlockByNumber "$params") || continue
+        if jq -e --argjson params "$params" 'length==($params|length) and
+            all(to_entries[]; .key as $i | .value |
+                type=="object" and .number==$params[$i][0] and
+                (.hash|test("^0x[0-9a-fA-F]{64}$")))' <<< "$headers" >/dev/null 2>&1; then
+            echo "$headers"; return 0
+        fi
+        # A partial primary response must not hide a known reorg behind a
+        # complete but stale fallback. Check every usable header before trying it.
+        while read -r number hash; do
+            network_track_block "$chain" "$number" "$hash" || return 75
+        done < <(jq -r --argjson params "$params" 'to_entries[] |
+            .key as $i | .value | select(type=="object") |
+            select(.number==$params[$i][0] and (.hash|type)=="string") |
+            select(.hash|test("^0x[0-9a-fA-F]{64}$")) | [.number,.hash]|join(" ")' <<< "$headers")
+    done < <(network_urls "$chain")
+    return 2
+}
+
 network_urls() {
     if [[ "$1" == L1 ]]; then
         printf '%s\n' "${L1_RPC:-$RPC}" "${L1_FRONT:-${L1_RPC:-$RPC}}"
@@ -73,12 +137,20 @@ network_track_receipt() {
     NETWORK_RECEIPTS["$chain:$tx"]="$receipt"
 }
 network_evidence_check() {
-    local key chain number expected header
+    local chain key number expected params headers
     [[ "${NETWORK_UNSTABLE:-false}" == false ]] || return 75
-    for key in "${!NETWORK_BLOCKS[@]}"; do
-        chain="${key%%:*}"; number="${key#*:}"; expected="${NETWORK_BLOCKS[$key]}"
-        header=$(network_header "$chain" "$(printf '0x%x' "$number")") || return 75
-        [[ $(jq -r .hash <<< "$header") == "$expected" ]] || return 75
+    for chain in L1 L2; do
+        expected=$(
+            for key in "${!NETWORK_BLOCKS[@]}"; do
+                [[ "$key" == "$chain:"* ]] || continue
+                number="${key#*:}"
+                printf '0x%x %s\n' "$number" "${NETWORK_BLOCKS[$key]}"
+            done | jq -Rsc 'split("\n")|map(select(length>0)|split(" ")|{number:.[0],hash:.[1]})'
+        ) || return 75
+        [[ "$expected" != '[]' ]] || continue
+        params=$(jq -c 'map([.number,false])' <<< "$expected") || return 75
+        headers=$(network_headers "$chain" "$params") || return 75
+        jq -e --argjson expected "$expected" 'map({number,hash})==$expected' <<< "$headers" >/dev/null || return 75
     done
 }
 _network_valid_receipt() {
@@ -229,25 +301,29 @@ network_resolve_correlations() {
     _CORR_LAST=$(printf '%s\n' "${numbers[@]}" | sort -n | tail -1)
 }
 network_correlated_l2_blocks() {
-    local tx item block number hash blocks='[]' selected='[]'
+    local tx item number hash selected='[]' blocks candidates=''
     for tx in "${L1_BATCH_TXS[@]}"; do
         item=$(jq -c --arg tx "$tx" '[.[]|select(.l1TransactionHash==$tx)]' <<< "$_CORRELATIONS")
         [[ "$item" != '[]' ]] || return 2
         selected=$(jq -cn --argjson old "$selected" --argjson new "$item" '$old+$new|unique_by(.l1TransactionHash)')
     done
-    while read -r block; do
-        read -r number hash < <(jq -r '[.number,.hash]|join(" ")' <<< "$block")
-        network_track_block L2 "$number" "$hash" || return 2
-        blocks=$(jq -cn --argjson old "$blocks" --argjson n "$((number))" '$old+[$n]|unique')
-    done < <(jq -c '.[].l2Blocks[]' <<< "$selected")
+    blocks=$(jq -c '[.[].l2Blocks[]]|unique_by(.number,.hash)' <<< "$selected") || return 1
     [[ "$blocks" != '[]' ]] || return 2
-    L2_BLOCKS="$blocks"
+    while read -r number hash; do
+        network_track_block L2 "$number" "$hash" || return 2
+        candidates+="$((number))"$'\n'
+    done < <(jq -r '.[]|[.number,.hash]|join(" ")' <<< "$blocks")
+    L2_BLOCKS=$(printf '%s' "$candidates" | jq -Rsc 'split("\n")|map(select(length>0)|tonumber)|unique')
 }
 network_pin_l2_blocks() {
-    local number header
-    while read -r number; do
-        header=$(network_header L2 "$(printf '0x%x' "$number")") || return 2
-        network_track_block L2 "$number" "$(jq -r .hash <<< "$header")" || return 2
-    done < <(jq -r '.[]' <<< "$L2_BLOCKS")
+    local params headers number hash
+    [[ "$L2_BLOCKS" != '[]' ]] || return 0
+    params=$(
+        while read -r number; do printf '0x%x\n' "$number"; done < <(jq -r '.[]' <<< "$L2_BLOCKS") |
+            jq -Rsc 'split("\n")|map(select(length>0)|[.,false])'
+    ) || return 2
+    headers=$(network_headers L2 "$params") || return 2
+    while read -r number hash; do
+        network_track_block L2 "$number" "$hash" || return 2
+    done < <(jq -r '.[]|[.number,.hash]|join(" ")' <<< "$headers")
 }
-

@@ -595,47 +595,68 @@ if [[ "${FAILED:-false}" != true && -n "${L1_BATCH_TX:-}" ]] && $_L1_TABLES_PRES
 fi
 
 # ══════════════════════════════════════════════
-#  6. Verify all exact L2 blocks of the matched settlements.
-#     Without correlation, retain content discovery over the pre-trigger window.
+#  6. Discover L2 blocks by expected call hashes, using the original range scan.
+#     Correlation bounds the search and pins every candidate block's hash;
+#     only matching blocks (plus L2 trigger blocks) need detailed event checks.
 # ══════════════════════════════════════════════
 L2_BLOCKS="[]"
+_CORRELATED_L2_BLOCKS="[]"
+_SCAN_FROM="${L2_BLOCK_BEFORE:-${L2_BLOCK:-0}}"
+_SCAN_TO=""
 if [[ "$_CORRELATIONS" != '[]' && ${#L1_BATCH_TXS[@]} -gt 0 ]]; then
-    # Keep every exact block from every matched settlement, including split jobs.
-    if ! network_correlated_l2_blocks || ! network_pin_l2_blocks; then
+    if ! network_correlated_l2_blocks; then
         network_retry "correlated L2 blocks unavailable or replaced" || exit 1
         continue
     fi
-    echo "L2 blocks from matched settlement transactions: $L2_BLOCKS"
-else
-    if [[ "$_TRIGGER_CHAIN" == L2 ]]; then
-        L2_BLOCKS=$(printf '%s\n' "${TX_BLOCK_NUMBERS[@]}" | jq -sc 'unique')
-    fi
-    if [[ -n "${EXPECTED_L2_CALL_HASHES:-}" && "$EXPECTED_L2_CALL_HASHES" != '[]' ]]; then
-        _SCAN_FROM="${L2_BLOCK_BEFORE:-${L2_BLOCK:-0}}"
-        _l2_calls_scan_latest() {
-            network_evidence_check || return 75
-            forge script script/e2e/scenarios/shared/Verify.s.sol:VerifyL2CallsInRange \
-                --rpc-url "$L2_RPC" --sig "run(uint256,uint256,address,bytes32[])" \
-                "$_SCAN_FROM" "$(cast block-number --rpc-url "$L2_RPC")" "$MANAGER_L2" "$EXPECTED_L2_CALL_HASHES"
-        }
-        _Batch_RC=0
-        retry_until_deadline "${L2_SETTLE_TIMEOUT:-180}" 5 _l2_calls_scan_latest || _Batch_RC=$?
-        if (( _Batch_RC == 75 )); then
-            network_retry "inclusion changed during L2 discovery" || exit 1
-            continue
-        elif (( _Batch_RC == 0 )); then
-            _FOUND_LIST=$(extract "$RETRY_OUT" L2_MATCH_BLOCKS)
-            L2_BLOCKS=$(jq -cn --argjson old "$L2_BLOCKS" --argjson new "$_FOUND_LIST" '$old+$new|unique')
-        else
-            FAILED=true
-            echo "L2 VERIFICATION FAILED: expected calls not found"
-        fi
-    fi
-    if ! network_pin_l2_blocks; then
-        network_retry "L2 verification blocks unavailable or replaced" || exit 1
-        continue
-    fi
+    _CORRELATED_L2_BLOCKS="$L2_BLOCKS"
+    read -r _SCAN_FROM _SCAN_TO < <(jq -r '[min,max]|map(tostring)|join(" ")' <<< "$_CORRELATED_L2_BLOCKS")
 fi
+L2_BLOCKS="[]"
+if [[ "$_TRIGGER_CHAIN" == L2 ]]; then
+    L2_BLOCKS=$(printf '%s\n' "${TX_BLOCK_NUMBERS[@]}" | jq -sc 'unique')
+fi
+if [[ -n "${EXPECTED_L2_CALL_HASHES:-}" && "$EXPECTED_L2_CALL_HASHES" != '[]' ]]; then
+    _l2_calls_scan_latest() {
+        network_evidence_check || return 75
+        local to="$_SCAN_TO"
+        [[ -n "$to" ]] || to=$(cast block-number --rpc-url "$L2_RPC") || return 1
+        forge script script/e2e/scenarios/shared/Verify.s.sol:VerifyL2CallsInRange \
+            --rpc-url "$L2_RPC" --sig "run(uint256,uint256,address,bytes32[])" \
+            "$_SCAN_FROM" "$to" "$MANAGER_L2" "$EXPECTED_L2_CALL_HASHES"
+    }
+    _Batch_RC=0
+    retry_until_deadline "${L2_SETTLE_TIMEOUT:-180}" 5 _l2_calls_scan_latest || _Batch_RC=$?
+    if (( _Batch_RC == 75 )); then
+        network_retry "inclusion changed during L2 discovery" || exit 1
+        continue
+    elif (( _Batch_RC == 0 )); then
+        _FOUND_LIST=$(extract "$RETRY_OUT" L2_MATCH_BLOCKS)
+        if ! jq -e 'type=="array" and length>0 and all(.[]; type=="number" and .>=0 and floor==.)' \
+            <<< "$_FOUND_LIST" >/dev/null 2>&1; then
+            FAILED=true
+            echo "L2 VERIFICATION FAILED: invalid matching-block list"
+        elif [[ "$_CORRELATED_L2_BLOCKS" != '[]' ]] && \
+            ! jq -e --argjson allowed "$_CORRELATED_L2_BLOCKS" '.-$allowed|length==0' \
+                <<< "$_FOUND_LIST" >/dev/null; then
+            FAILED=true
+            echo "L2 VERIFICATION FAILED: matching blocks fall outside the matched settlements"
+        else
+            L2_BLOCKS=$(jq -cn --argjson old "$L2_BLOCKS" --argjson new "$_FOUND_LIST" '$old+$new|unique')
+        fi
+    else
+        FAILED=true
+        echo "L2 VERIFICATION FAILED: expected calls not found"
+    fi
+elif [[ "${EXPECTED_L2_HASHES:-[]}" != '[]' && "$_CORRELATED_L2_BLOCKS" != '[]' ]]; then
+    # A table with no expected call events cannot be located by call hashes.
+    # Preserve the existing exact-block coverage for this case.
+    L2_BLOCKS="$_CORRELATED_L2_BLOCKS"
+fi
+if ! network_pin_l2_blocks; then
+    network_retry "L2 verification blocks unavailable or replaced" || exit 1
+    continue
+fi
+echo "L2 blocks to verify: $L2_BLOCKS"
 
 # ══════════════════════════════════════════════
 #  7. Verify L2 table (ExecutionTableLoaded event)

@@ -294,7 +294,21 @@ hint is available, `eth_getBlockReceipts(blockHash)` can recover the receipt by
 transaction hash. Receipt status and canonical block hash are still checked.
 Calldata may be cached by transaction hash; receipt block numbers are not cached.
 
-Before reporting a result, all observed block hashes are checked again.
+L2 discovery uses the existing Forge `VerifyL2CallsInRange` scanner: one
+`eth_getLogs` range query per attempt finds the expected call hashes. Matched
+settlements bound the range, and matches must belong to those settlements.
+Detailed table and call checks receive matching blocks plus L2 trigger blocks,
+rather than every block in the settlement. A table with no expected call events
+retains exact settlement-block coverage because call hashes cannot locate it.
+Without correlation, discovery retains the pre-trigger-to-current-head scan.
+Bash does not prefetch events, and the Solidity verifiers are unchanged.
+
+Header reads use RPC batches of at most 100 requests. Replies are matched by ID
+and must be complete; an explicit batch rejection uses individual requests.
+All correlated blocks, including empty ones, retain their canonical hash checks.
+
+Before reporting a result, all observed block hashes are checked again, using
+batched header reads.
 Changed or unavailable inclusion evidence discards the pass and refreshes the
 receipts and correlations. A semantic mismatch with unchanged canonical evidence
 remains a failure. Verification retries never submit transactions.

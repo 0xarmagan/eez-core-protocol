@@ -27,10 +27,11 @@ def h(n): return "0x"+format(n,"064x")
 def save(): (root/"state.json").write_text(json.dumps(state))
 def block(chain,n):
     suffix=1 if state.get("changed") else 0
+    if chain==2 and state.get("empty_changed") and n<position()[1]: suffix=2
     return {"number":hex(n),"hash":h(chain*10000+n*10+suffix)}
 def position(index=0):
     moved=1 if mode=="reorg_move" and state.get("changed") else 0
-    return 100+index+moved,200+index+moved
+    return 100+index+moved,(400 if mode=="padded_large" else 200)+index*(3 if mode.startswith("split_gap") else 1)+moved
 def post(index=0):
     return h(12 if state.get("changed") else 11+index)
 def receipt(chain,tx):
@@ -49,10 +50,12 @@ def receipt(chain,tx):
 def correlation(index=0):
     l1,l2=position(index)
     a,b=block(1,l1),block(2,l2)
+    size=205 if mode=="padded_large" else 100 if mode.startswith("padded") else 1
+    history=[block(2,n) for n in range(l2-size+1,l2+1)]
     return {"l1BlockNumber":a["number"],"l1BlockHash":a["hash"],"l1TransactionHash":post(index),
-            "l1TransactionIndex":"0x0","matchedL2Block":b,"l2Blocks":[b],
-            "l2Range":{"firstBlockNumber":b["number"],"lastBlockNumber":b["number"],
-                       "firstBlockHash":b["hash"],"lastBlockHash":b["hash"],"blockCount":"0x1"},
+            "l1TransactionIndex":"0x0","matchedL2Block":b,"l2Blocks":history,
+            "l2Range":{"firstBlockNumber":history[0]["number"],"lastBlockNumber":b["number"],
+                       "firstBlockHash":history[0]["hash"],"lastBlockHash":b["hash"],"blockCount":hex(size)},
             "canonicalL2":True,"l2Finalized":False}
 if name=="date":
     print(clock); sys.exit()
@@ -95,10 +98,17 @@ if name=="forge":
         print("L1_BATCH_TX_CANDIDATE="+post())
         if mode.startswith("split"): print("L1_BATCH_TX_CANDIDATE="+post(1))
     elif ":VerifyL2CallsInRange" in text:
+        if mode=="discovery_missing":
+            save(); print("FAIL: expected L2 calls missing"); sys.exit(1)
+        matches=[position(i)[1] for i in range(2 if mode.startswith("split") else 1)]
+        if mode=="split_gap_wrong": matches[0]+=1
         print("PASS: L2 calls found")
-        print("L2_MATCH_BLOCKS=[200]")
+        print("L2_MATCH_BLOCKS="+("invalid" if mode=="discovery_malformed" else json.dumps(matches, separators=(",", ":"))))
+        if mode=="discovery_reorg" and not state.get("changed"): state["changed"]=True
     elif ":VerifyL2Blocks" in text or ":VerifyL2Calls " in text:
-        if mode.startswith("split"): assert "[200,201]" in args,args
+        if mode.startswith("split"):
+            expected=json.dumps([position(0)[1],position(1)[1]], separators=(",", ":"))
+            assert expected in args,args
         key="L2_TABLE_TX" if ":VerifyL2Blocks" in text else "L2_CALL_TX"
         print("PASS: L2 semantic checks match")
         print(key+"="+h(21))
@@ -106,50 +116,75 @@ if name=="forge":
     else: raise AssertionError(args)
     if mode=="reorg_after_pass" and ":VerifyL2Calls " in text and not state.get("changed"):
         state["changed"]=True
+    if mode=="padded_empty_reorg" and ":VerifyL2Calls " in text:
+        state["empty_changed"]=True
     save(); sys.exit()
 assert name=="curl",name
-request=json.loads(args[args.index("--data")+1])
-method=request["method"]; params=request["params"]; endpoint=args[-1]
-chain=1 if endpoint.endswith("1") else 2
-state.setdefault("calls",[]).append([endpoint,method,params])
-result=None
-error=None
-if method.startswith("eez_"):
-    if endpoint.startswith("direct") or mode=="unsupported": error={"code":-32601,"message":"Method not found"}
-    elif mode=="invalid_params": error={"code":-32602,"message":"Invalid params"}
-    elif mode=="catchup" and clock<1002: error={"code":-32001,"message":"Index catching up"}
-    elif method=="eez_getCrossChainTransaction": result=None
-    elif params==["0x1"]: result=None
-    else:
-        assert isinstance(params[0],dict) and "blockHash" in params[0],params
-        matches=[]
+def respond(request):
+    method=request["method"]; params=request["params"]; endpoint=args[-1]
+    chain=1 if endpoint.endswith("1") else 2
+    state.setdefault("calls",[]).append([endpoint,method,params])
+    result=None
+    error=None
+    if method.startswith("eez_"):
+        if endpoint.startswith("direct") or mode=="unsupported": error={"code":-32601,"message":"Method not found"}
+        elif mode=="invalid_params": error={"code":-32602,"message":"Invalid params"}
+        elif mode=="catchup" and clock<1002: error={"code":-32001,"message":"Index catching up"}
+        elif method=="eez_getCrossChainTransaction": result=None
+        elif params==["0x1"]: result=None
+        else:
+            assert isinstance(params[0],dict) and "blockHash" in params[0],params
+            matches=[]
+            for index in range(2 if mode.startswith("split") else 1):
+                c=correlation(index)
+                expected=c["matchedL2Block"]["hash"] if method=="eez_getSettlementByL2Block" else c["l1BlockHash"]
+                if params[0]["blockHash"]==expected: matches.append(c)
+            result=(matches[0] if matches else None) if method=="eez_getSettlementByL2Block" else matches
+    elif method=="eth_getBlockByNumber":
+        result=block(chain,202 if chain==2 else 102) if params[0]=="latest" else block(chain,int(params[0],16))
+    elif method in ("eth_getTransactionReceipt","eth_getTransactionByHash"):
+        r=receipt(chain,params[0])
+        if mode=="delivery_indexes_missing" and params[0] in (h(21),h(22)):
+            result=None
+        elif method=="eth_getTransactionReceipt":
+            result=None if mode=="block_receipts" else r
+        elif r:
+            result={**r,"hash":params[0],"input":"0x0012" if params[0]==h(12) else "0x0011"}
+    elif method=="eth_getTransactionByBlockHashAndIndex":
         for index in range(2 if mode.startswith("split") else 1):
-            c=correlation(index)
-            expected=c["matchedL2Block"]["hash"] if method=="eez_getSettlementByL2Block" else c["l1BlockHash"]
-            if params[0]["blockHash"]==expected: matches.append(c)
-        result=(matches[0] if matches else None) if method=="eez_getSettlementByL2Block" else matches
-elif method=="eth_getBlockByNumber":
-    result=block(chain,202 if chain==2 else 102) if params[0]=="latest" else block(chain,int(params[0],16))
-elif method in ("eth_getTransactionReceipt","eth_getTransactionByHash"):
-    r=receipt(chain,params[0])
-    if mode=="delivery_indexes_missing" and params[0] in (h(21),h(22)):
-        result=None
-    elif method=="eth_getTransactionReceipt":
-        result=None if mode=="block_receipts" else r
-    elif r:
-        result={**r,"hash":params[0],"input":"0x0012" if params[0]==h(12) else "0x0011"}
-elif method=="eth_getTransactionByBlockHashAndIndex":
-    for index in range(2 if mode.startswith("split") else 1):
-        r=receipt(chain,post(index))
-        if r and r["blockHash"]==params[0]: result={**r,"hash":post(index),"input":"0x0011"}
-elif method=="eth_getBlockReceipts":
-    result=[r for tx in (h(1),h(2),post(),post(1),h(21),h(22))
-            if (r:=receipt(chain,tx)) and r["blockHash"]==params[0]]
-    result=list({r["transactionHash"]:r for r in result}.values())
+            r=receipt(chain,post(index))
+            if r and r["blockHash"]==params[0]: result={**r,"hash":post(index),"input":"0x0011"}
+    elif method=="eth_getBlockReceipts":
+        result=[r for tx in (h(1),h(2),post(),post(1),h(21),h(22))
+                if (r:=receipt(chain,tx)) and r["blockHash"]==params[0]]
+        result=list({r["transactionHash"]:r for r in result}.values())
+    else:
+        raise AssertionError((method,params))
+    return {"jsonrpc":"2.0","id":request["id"],**({"error":error} if error else {"result":result})}
+raw=args[args.index("--data")+1]
+request=json.loads(sys.stdin.read() if raw=="@-" else raw)
+state["http_requests"]=state.get("http_requests",0)+1
+if isinstance(request,list):
+    state.setdefault("batches",[]).append([args[-1],request[0]["method"],len(request)])
+    if mode=="batch_unsupported":
+        response={"jsonrpc":"2.0","id":None,"error":{"code":-32600,"message":"Batch unsupported"}}
+    else:
+        response=list(reversed([respond(item) for item in request]))
+        if mode=="batch_missing": response=response[:-1]
+        if mode=="batch_duplicate": response=response+response[:1]
+        if mode=="batch_wrong_id": response[0]["id"]=999
+        if mode=="batch_member_error":
+            response[0]={"jsonrpc":"2.0","id":response[0]["id"],"error":{"code":-32000,"message":"Unavailable"}}
+        if mode=="batch_null_primary" and args[-1].startswith("direct"):
+            response[0]["result"]=None
+        if mode=="padded_partial_reorg" and args[-1]=="direct2" and request[0]["method"]=="eth_getBlockByNumber" and len(response)>1:
+            response[0]["result"]["hash"]=h(999)
+            response[1]["result"]=None
 else:
-    raise AssertionError((method,params))
+    response=respond(request)
 save()
-print(json.dumps({"jsonrpc":"2.0","id":1,**({"error":error} if error else {"result":result})}))
+print(json.dumps(response))
+
 '''
 
 
@@ -175,7 +210,8 @@ class NetworkEvidenceTests(unittest.TestCase):
                 "_SENDER=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
                 "EXPECTED_L1_CALL_HASHES='[]'\nEXPECTED_L1_HASHES='[]'\n"
                 "EXPECTED_L1_TABLE=0x01\nEXPECTED_L1_STEPS=0x1234\nEXPECTED_L1_STATIC_TABLE=0x\n"
-                "EXPECTED_L2_HASHES='[0x01]'\nEXPECTED_L2_CALL_HASHES='[0x02]'\n"
+                "EXPECTED_L2_HASHES='[0x01]'\n"
+                f"EXPECTED_L2_CALL_HASHES='{('[]' if mode=='padded_table_only' else '[0x02]')}'\n"
                 "EXPECTED_L2_TABLE=0x01\nEVENTLESS_L2_HASHES='[]'\nABSENT_L2_HASHES='[]'\n")
             (root / "snapshot.env").write_text("L1_BLOCK_BEFORE=90\nL2_BLOCK_BEFORE=190\n")
             (root / "Scenario.sol").write_text("contract ComputeExpected {}\n")
@@ -190,6 +226,7 @@ class NetworkEvidenceTests(unittest.TestCase):
                  "--rollups", "0x" + "a" * 40, "--manager-l2", "0x" + "b" * 40],
                 cwd=REPO, env={**os.environ, "PATH": str(binaries) + ":" + os.environ["PATH"],
                     "TEST_ROOT": directory, "TEST_MODE": mode, "TEST_DIRECTION": direction,
+                    "PYTHONDONTWRITEBYTECODE": "1",
                     "E2E_STAGE": "verify", "E2E_JOB_DIR": str(job),
                     "E2E_SNAPSHOT": str(root / "snapshot.env"), "E2E_L1TX_CACHE": str(cache),
                     "E2E_VERIFY_TIMEOUT": "8", "E2E_CORRELATION": "auto"},
@@ -278,6 +315,79 @@ class NetworkEvidenceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(clock, 1008)
         self.assertIn("deadline expired", result.stderr)
+
+    def test_range_discovery_checks_only_matching_blocks_but_revalidates_all_hashes(self):
+        for mode, expected_block, count in (("padded", 200, 100), ("padded_large", 400, 205)):
+            with self.subTest(mode=mode):
+                _, state, _ = self.assert_passes(mode)
+                verifiers = [args for args in state["forge"]
+                             if any(a.endswith(":VerifyL2Blocks") or a.endswith(":VerifyL2Calls") for a in args)]
+                self.assertTrue(verifiers)
+                for args in verifiers:
+                    self.assertIn(f"[{expected_block}]", args)
+                scans = [args for args in state["forge"] if any(a.endswith(":VerifyL2CallsInRange") for a in args)]
+                self.assertEqual(len(scans), 1)
+                self.assertEqual(scans[0][-4:-2], [str(expected_block-count+1), str(expected_block)])
+                self.assertFalse(any(method=="eth_getLogs" for _, method, _ in state["calls"]))
+                self.assertLess(state["http_requests"], 40)
+                self.assertTrue(all(size<=100 for _, _, size in state["batches"]))
+                expected = {hex(n) for n in range(expected_block-count+1, expected_block+1)}
+                checked = {params[0] for endpoint, method, params in state["calls"]
+                           if endpoint.endswith("2") and method=="eth_getBlockByNumber"}
+                self.assertTrue(expected.issubset(checked))
+
+    def test_reorg_of_an_empty_correlated_block_still_restarts_verification(self):
+        result, state, _ = self.assert_passes("padded_empty_reorg")
+        self.assertEqual(state["decodes"], 2)
+        self.assertEqual(result.stdout.count("====== Done ======"), 1)
+        self.assertIn("discarding this pass", result.stderr)
+
+    def test_batches_fall_back_when_explicitly_unsupported_or_primary_lags(self):
+        for mode in ("batch_unsupported", "batch_null_primary"):
+            with self.subTest(mode=mode):
+                self.assert_passes(mode)
+
+    def test_missing_duplicate_wrong_id_and_error_batch_members_never_pass(self):
+        for mode in ("batch_missing", "batch_duplicate", "batch_wrong_id", "batch_member_error"):
+            with self.subTest(mode=mode):
+                result, _, _ = self.run_verifier(mode)
+                self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+                self.assertNotIn("====== Done ======", result.stdout)
+
+    def test_partial_primary_reorg_cannot_be_hidden_by_stale_fallback(self):
+        result, _, clock = self.run_verifier("padded_partial_reorg")
+        self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+        self.assertEqual(clock, 1008)
+        self.assertNotIn("====== Done ======", result.stdout)
+
+    def test_discovery_keeps_split_matches_without_accepting_gap_blocks(self):
+        for direction in ("L1", "L2"):
+            with self.subTest(direction=direction):
+                self.assert_passes("split_gap", direction)
+                result, _, _ = self.run_verifier("split_gap_wrong", direction)
+                self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+                self.assertIn("outside the matched settlements", result.stdout)
+                self.assertNotIn("====== Done ======", result.stdout)
+
+    def test_discovery_failure_or_malformed_matches_cannot_pass(self):
+        for mode in ("discovery_missing", "discovery_malformed"):
+            with self.subTest(mode=mode):
+                result, _, _ = self.run_verifier(mode)
+                self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+                self.assertNotIn("====== Done ======", result.stdout)
+
+    def test_reorg_during_discovery_restarts_with_fresh_receipts(self):
+        result, state, _ = self.assert_passes("discovery_reorg")
+        self.assertEqual(state["decodes"], 2)
+        self.assertEqual(result.stdout.count("====== Done ======"), 1)
+        self.assertIn("L1 postBatch:   " + h(12), result.stdout)
+
+    def test_table_without_call_events_retains_settlement_coverage(self):
+        _, state, _ = self.assert_passes("padded_table_only", "L1")
+        self.assertFalse(any(any(a.endswith(":VerifyL2CallsInRange") for a in args) for args in state["forge"]))
+        tables = [args for args in state["forge"] if any(a.endswith(":VerifyL2Blocks") for a in args)]
+        self.assertEqual(len(tables), 1)
+        self.assertIn(json.dumps(list(range(101, 201)), separators=(",", ":")), tables[0])
 
     def test_invalid_parameters_do_not_fall_back_or_loop(self):
         result, _, clock = self.run_verifier("invalid_params")
