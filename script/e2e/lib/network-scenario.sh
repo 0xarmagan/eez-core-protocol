@@ -766,16 +766,26 @@ if [[ "$FAILED" != true ]]; then
     while read -r _number; do
         _l2_receipt_hints+="${NETWORK_BLOCKS[L2:$_number]}"$'\n'
     done < <(jq -r '.[]' <<< "$L2_BLOCKS")
+    _l2_receipt_txs=$(printf '%s\n' "${VERIFY_STEP_OUT[L2 TABLE]:-}" "${VERIFY_STEP_OUT[L2 CALL]:-}" |
+        sed -nE 's/.*L2_(TABLE|CALL)_TX=(0x[0-9a-fA-F]{64}).*/\2/p' | sort -u |
+        jq -Rsc 'split("\n")|map(select(length>0))')
+    _l2_block_receipts='[]'
+    if [[ "$_l2_receipt_txs" != '[]' ]]; then
+        _l2_block_receipts=$(network_receipts_from_blocks L2 "$_l2_receipt_txs" "${_l2_receipt_hints%$'\n'}") || _l2_block_receipts='[]'
+    fi
     while read -r _tx; do
         [[ -n "$_tx" ]] || continue
-        if ! _receipt=$(network_receipt L2 "$_tx" "${_l2_receipt_hints%$'\n'}"); then _receipts_ready=false; break; fi
+        if [[ "$_l2_block_receipts" != '[]' ]]; then
+            _receipt=$(jq -c --arg tx "$_tx" '.[]|select(.transactionHash==$tx)' <<< "$_l2_block_receipts")
+        elif ! _receipt=$(network_receipt L2 "$_tx" "${_l2_receipt_hints%$'\n'}"); then
+            _receipts_ready=false; break
+        fi
         if ! network_track_receipt L2 "$_tx" "$_receipt"; then _receipts_ready=false; break; fi
         if [[ $(jq -r .status <<< "$_receipt") != 0x1 ]]; then
             echo "FAIL: matched L2 transaction reverted: $_tx"
             FAILED=true
         fi
-    done < <(printf '%s\n' "${VERIFY_STEP_OUT[L2 TABLE]:-}" "${VERIFY_STEP_OUT[L2 CALL]:-}" |
-        sed -nE 's/.*L2_(TABLE|CALL)_TX=(0x[0-9a-fA-F]{64}).*/\2/p' | sort -u)
+    done < <(jq -r '.[]' <<< "$_l2_receipt_txs")
     if ! $_receipts_ready; then
         network_retry "matched L2 receipt unavailable or changed" || exit 1
         continue

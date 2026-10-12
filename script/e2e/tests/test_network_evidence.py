@@ -43,10 +43,12 @@ def receipt(chain,tx):
     if tx in (h(1),h(2)) and chain==(1 if direction=="L1" else 2): n=l1 if chain==1 else l2
     if chain==1 and tx==post(index): n=l1
     if chain==2 and tx in (h(21),h(22)): n=l2
+    if chain==2 and mode=="many_receipts" and tx in [h(i) for i in range(21,46)]: n=l2
     if n is None: return None
     b=block(chain,n)
     return {"transactionHash":tx,"blockNumber":hex(n),"blockHash":b["hash"],
-            "transactionIndex":"0x0","status":"0x1","to":"0x"+"a"*40,"logs":[]}
+            "transactionIndex":"0x0","status":"0x0" if mode=="delivery_reverted" and chain==2 and tx==h(21) else "0x1",
+            "to":"0x"+"a"*40,"logs":[]}
 def correlation(index=0):
     l1,l2=position(index)
     a,b=block(1,l1),block(2,l2)
@@ -113,6 +115,8 @@ if name=="forge":
         print("PASS: L2 semantic checks match")
         print(key+"="+h(21))
         if mode.startswith("split"): print(key+"="+h(22))
+        if mode=="many_receipts" and key=="L2_CALL_TX":
+            for i in range(22,46): print(key+"="+h(i))
     else: raise AssertionError(args)
     if mode=="reorg_after_pass" and ":VerifyL2Calls " in text and not state.get("changed"):
         state["changed"]=True
@@ -144,7 +148,7 @@ def respond(request):
         result=block(chain,202 if chain==2 else 102) if params[0]=="latest" else block(chain,int(params[0],16))
     elif method in ("eth_getTransactionReceipt","eth_getTransactionByHash"):
         r=receipt(chain,params[0])
-        if mode=="delivery_indexes_missing" and params[0] in (h(21),h(22)):
+        if (mode=="delivery_indexes_missing" or mode.startswith("delivery_bad_")) and params[0] in (h(21),h(22)):
             result=None
         elif method=="eth_getTransactionReceipt":
             result=None if mode=="block_receipts" else r
@@ -158,6 +162,19 @@ def respond(request):
         result=[r for tx in (h(1),h(2),post(),post(1),h(21),h(22))
                 if (r:=receipt(chain,tx)) and r["blockHash"]==params[0]]
         result=list({r["transactionHash"]:r for r in result}.values())
+        if chain==2:
+            if mode=="many_receipts":
+                result=[receipt(chain,h(i)) for i in range(21,46)]
+                result[0]["logs"]=[{"data":"0x"+"ab"*100000}]
+            if mode=="delivery_block_unsupported": error={"code":-32601,"message":"Unsupported"}
+            if mode=="delivery_block_incomplete": result=[]
+            for r in result:
+                if r["transactionHash"]!=h(21): continue
+                if mode=="delivery_bad_hash": r["blockHash"]=h(999)
+                if mode=="delivery_bad_number": r["blockNumber"]="0x999"
+                if mode=="delivery_bad_status": r["status"]=None
+            if mode=="delivery_bad_duplicate": result+= [r for r in result if r["transactionHash"]==h(21)]
+            if mode=="delivery_block_reorg" and not state.get("changed"): state["changed"]=True
     else:
         raise AssertionError((method,params))
     return {"jsonrpc":"2.0","id":request["id"],**({"error":error} if error else {"result":result})}
@@ -388,6 +405,43 @@ class NetworkEvidenceTests(unittest.TestCase):
         tables = [args for args in state["forge"] if any(a.endswith(":VerifyL2Blocks") for a in args)]
         self.assertEqual(len(tables), 1)
         self.assertIn(json.dumps(list(range(101, 201)), separators=(",", ":")), tables[0])
+
+    def test_many_delivery_receipts_share_one_exact_block_read(self):
+        result, state, _ = self.assert_passes("many_receipts")
+        block_reads=[params for endpoint, method, params in state["calls"]
+                     if endpoint.endswith("2") and method=="eth_getBlockReceipts"]
+        self.assertEqual(block_reads, [[h(2*10000+200*10)]])
+        delivery_hashes={h(i) for i in range(21,46)}
+        self.assertFalse(any(method=="eth_getTransactionReceipt" and params[0] in delivery_hashes
+                             for _, method, params in state["calls"]))
+        for tx in delivery_hashes:
+            self.assertIn(tx+"  (block 200)", result.stdout)
+
+    def test_unavailable_block_receipts_use_individual_lookup(self):
+        for mode in ("delivery_block_unsupported", "delivery_block_incomplete"):
+            with self.subTest(mode=mode):
+                _, state, _ = self.assert_passes(mode)
+                self.assertTrue(any(method=="eth_getTransactionReceipt" and params==[h(21)]
+                                    for _, method, params in state["calls"]))
+
+    def test_invalid_block_receipts_cannot_satisfy_required_deliveries(self):
+        for mode in ("delivery_bad_hash", "delivery_bad_number", "delivery_bad_status", "delivery_bad_duplicate"):
+            with self.subTest(mode=mode):
+                result, _, _ = self.run_verifier(mode)
+                self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+                self.assertNotIn("====== Done ======", result.stdout)
+
+    def test_block_receipt_reorg_refreshes_the_whole_verification(self):
+        result, state, _ = self.assert_passes("delivery_block_reorg")
+        self.assertEqual(state["decodes"], 2)
+        self.assertEqual(result.stdout.count("====== Done ======"), 1)
+
+    def test_reverted_delivery_receipt_remains_a_failure(self):
+        result, state, _ = self.run_verifier("delivery_reverted")
+        self.assertEqual(result.returncode, 1, result.stdout+result.stderr)
+        self.assertEqual(state["decodes"], 1)
+        self.assertIn("matched L2 transaction reverted", result.stdout)
+        self.assertNotIn("====== Done ======", result.stdout)
 
     def test_invalid_parameters_do_not_fall_back_or_loop(self):
         result, _, clock = self.run_verifier("invalid_params")

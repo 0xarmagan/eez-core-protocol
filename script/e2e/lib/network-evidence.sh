@@ -198,6 +198,38 @@ network_receipt() { # chain, tx hash, optional exact block hint; one bounded swe
     done
     return 2
 }
+# Read known delivery blocks once per pass instead of rereading the same header
+# for every transaction. Failure leaves the individual receipt path available.
+network_receipts_from_blocks() { # chain, JSON tx hashes, newline-delimited block hashes
+    local chain="$1" wanted="$2" hints="$3" block rpc out receipts header found='[]'
+    [[ "$wanted" != '[]' && -n "$hints" ]] || return 2
+    while read -r block; do
+        [[ -n "$block" ]] || continue
+        while read -r rpc; do
+            out=$(network_rpc "$rpc" eth_getBlockReceipts "[\"$block\"]") || continue
+            receipts=$(jq -ce --argjson wanted "$wanted" --arg block "$block" '
+                select(type=="array") |
+                [.[] | select(.transactionHash as $tx | $wanted | index($tx))] |
+                select(all(.[]; .blockHash==$block and
+                    (.blockNumber|test("^0x[0-9a-fA-F]+$")) and
+                    (.status=="0x0" or .status=="0x1"))) |
+                select((map(.transactionHash)|unique|length)==length) |
+                map({transactionHash,blockHash,blockNumber,transactionIndex,status,to})' \
+                <<< "$out" 2>/dev/null) || continue
+            [[ "$receipts" != '[]' ]] || break
+            header=$(network_header "$chain" "$(jq -r '.[0].blockNumber' <<< "$receipts")") || return 2
+            jq -e --arg block "$block" --argjson header "$header" '
+                $header.hash==$block and all(.[]; .blockNumber==$header.number)' \
+                <<< "$receipts" >/dev/null || return 2
+            found=$(printf '%s\n%s\n' "$found" "$receipts" | jq -cs 'add') || return 2
+            break
+        done < <(network_urls "$chain")
+    done <<< "$hints"
+    # Every requested transaction must occur exactly once, even across blocks.
+    jq -e --argjson wanted "$wanted" '(map(.transactionHash)|sort)==($wanted|sort)' \
+        <<< "$found" >/dev/null || return 2
+    echo "$found"
+}
 network_transaction_input() { # chain, hash, canonical receipt
     local chain="$1" tx="$2" receipt="$3" rpc obj block index
     block=$(jq -r .blockHash <<< "$receipt"); index=$(jq -r .transactionIndex <<< "$receipt")

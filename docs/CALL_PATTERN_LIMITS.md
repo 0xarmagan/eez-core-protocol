@@ -14,8 +14,8 @@ limitation are expected to pass until that limitation is fixed.
 **Decision:** mutable candidate retries are not implemented. Experiments are planned
 to assess whether they are worth implementing; no implementation decision has been
 made. The current support limits are documented in [Caveats](CAVEATS.md#delivery-and-execution-semantics).
-The proposals and regression checklist below guide that evaluation, not committed
-implementation work.
+The proposed hash-validated retry approach and regression checklist below guide
+that evaluation, not committed implementation work.
 
 A real remote contract can implement:
 
@@ -28,7 +28,9 @@ function run() external returns (uint256) {
 }
 ```
 
-The source application can legitimately do all of this in one transaction:
+For an L1-to-L2 call, `run()` is on L2 and reads the source application's rate
+through a callback to L1. The L1 application can legitimately do all of this in one
+transaction:
 
 ```solidity
 rate = 1;
@@ -48,6 +50,11 @@ hash check with `RollingHashMismatch`. The later success row is never tried. Thi
 not a missing-row example: the tests supply both alternatives, and the top-level
 tests show the success alternative resolves when loaded on its own at rate 2.
 Putting the success row first cannot faithfully produce the required initial failure.
+
+**Current limitation:** this valid sequence has no faithful table encoding under the
+current resolver rules when the retry preserves the call identity and lookup
+context. Both outcomes can be stored, but the contracts cannot select the second
+outcome after the local write.
 
 Confirmed on all four mutable lookup paths:
 
@@ -173,7 +180,7 @@ Retrying top-level candidates only after `RollingHashMismatch` cannot by itself
 address this case: both attempts occur inside one entry, and that entry can pass
 its hash check. Repeating the entry with unchanged nested selection also selects
 R100 again. Detection, alternative selection and failure propagation need to be
-designed together; see proposal 1 and the regression checklist below.
+designed together; see the proposed approach and regression checklist below.
 
 ## 2. Static results that depend on gas but have no distinguishing callbacks
 
@@ -210,103 +217,85 @@ Reordering the rows merely changes which rate fails. The output does not depend 
 `gasleft()`; the extra work from candidate search is the cause. Callers must budget
 for validation attempts, not only the intended remote execution.
 
-## Proposed improvements (not implemented)
+## Proposed approach: rolling-hash checks and alternative outcomes (not implemented)
 
-The following three approaches are design proposals. They do not change the current
-support claims above; each needs runtime, table/proof-format and regression-test
-validation before it can be treated as supported behavior.
+Use execution-dependent rolling-hash validation to select among alternative mutable
+outcomes, with each candidate executed in an isolated, revertible context. This is
+the proposed approach for both top-level and nested calls on L1 and L2. It needs
+runtime, table/proof-format and regression-test validation before it can be treated
+as supported behavior.
 
-### 1. Retry mutable candidates in an isolated execution context
+For the [revert, local write and identical retry scenario](#1-mutable-call-revert-local-write-identical-retry),
+use the existing top-level `ExecutionEntry.rollingHash`, computed from actual
+callback results, to select between separate entries carrying the alternative
+outcomes. Validate the hash after executing the callbacks in the isolated context.
+
+### Candidate validation and rollback
 
 Extend static-style candidate search to full execution entries and nested mutable
 entries on both L1 and L2:
 
 1. Find a candidate with matching call identity and applicable root/context checks.
 2. Open a revertible execution context and execute the candidate, including callbacks
-   and its rolling-hash validation.
-3. If the rolling hash does not match, revert that entire attempt and try the next
+   and its rolling-hash validation at a defined checkpoint.
+3. If validation fails, revert that entire attempt and try the next eligible
    candidate from the original context.
 4. If it matches, accept its outcome: commit a successful execution, or roll back and
    propagate its validated application revert. If no candidate validates, reject.
 
 The isolation boundary must include state writes, value transfers, root updates,
-queue/reentrant cursors and transient hash state. Internal mismatch signaling must
-be distinguishable from arbitrary application revert data. A hash-valid
+queue/reentrant cursors and transient hash state. The resolver must retain its search
+position outside the rejected candidate's rollback boundary so it can advance to
+another candidate within the same invocation. Internal validation-failure signaling
+must be distinguishable from arbitrary application revert data. A hash-valid
 `success == false` is the intended result, not permission to try a success candidate.
-For successful nested rows, define a locally checkable expected hash: the current
-`revertedOrStaticRollingHash` must be zero for those rows, so the existing field
-cannot simply be used as their validation target.
 
-For the stale successful-nested-answer case, evaluate both a candidate-specific
-callback/frame check before returning the saved answer and a nested closing hash
-that includes the answer (or its explicitly defined hash). Bind the candidate's
-expected hash and saved outcome to the same remote execution in the proof/table
-construction. Define matching checkpoints and seeds on both chains, and update
-runtime helpers, generation, reconstruction, proof constraints and test helpers
-together. These are design proposals, not a validated fix. Hashing the answer can
-detect surviving answer divergence; it does not prove completion of erased work.
+Each candidate must bind its expected hash and exactly one `(success, returnData)`
+pair to the same remote execution in the proof/table construction, including its
+callbacks and applicable root/ether transitions. Alternative outcomes must remain
+associated with their validated branches; array order alone is not a discriminator.
+Alternative candidates must also be distinguished from required sequential calls:
+skipping a required call must not become a successful lookup.
+
+### Successful nested calls need their own validation
+
+Retrying whole entries only after a final hash mismatch does not address the stale
+R100/R5 answer from section 1: the outer entry can pass that check. Successful nested
+candidates need a locally checkable expected callback/frame hash, validated before
+returning their saved answer. The current `revertedOrStaticRollingHash` must be zero
+for successful rows, so the existing field cannot simply be used as that target.
+
+Also bind the saved nested outcome into the nested closing hash, with precisely
+defined encoding, checkpoints and seeds on both chains. Update runtime helpers,
+generation, reconstruction, proof constraints and test helpers together. Outcome
+hashing complements candidate validation; it does not itself select the right
+candidate or prove completion of work erased by a parent revert. This remains an
+unimplemented design requiring validation.
 
 An application can catch a nested validation revert. Do not assume that throwing
-inside the resolver necessarily reaches a whole-entry retry boundary. The chosen
-design must prevent an inconsistent surviving outcome from committing while
+inside the resolver necessarily reaches a whole-entry retry boundary. Recovery or
+rejection must prevent an inconsistent surviving outcome from committing while
 preserving valid application reverts.
 
-This targets mutable retries, including successful calls undone by an enclosing
-revert, only where execution supplies a distinguishing validation result and can
-reach the matching alternative. Reverted attempts still spend gas; this does not
-resolve the fixed-budget limitation or establish exact gas-sensitive equivalence.
+### Scope and validation
 
-### 2. Optional per-call rolling-hash checks and alternative outcomes
+This approach targets mutable retries, including successful calls undone by an
+enclosing revert, where execution supplies a distinguishing validation result and
+can reach the matching alternative. Gas is not a dependable replacement for that
+validation: L1 currently excludes gas from outgoing lookup identity, and distinct
+attempts can have equal gas even when gas keying is enabled. Candidate search itself
+also changes the gas available to later attempts.
 
-Add an optional expected rolling hash to `L2ToL1Call` on L1, with a corresponding
-field on L2's incoming-call representation. When present, the hash must match;
-a mismatch causes the resolver to search for another eligible call candidate.
-When absent, it adds no hash constraint. Use an explicit presence flag so that
-`bytes32(0)` remains a valid expected hash.
+The gas-sensitive static example with identical callback hashes remains outside
+this guarantee. Adding alternative outcomes cannot distinguish an unobserved
+dependency. Rejected attempts still spend gas, so this approach also does not remove
+the fixed-budget limitation or establish exact gas-sensitive equivalence.
 
-The design must specify the checkpoint: a pre-call hash can filter candidates
-before execution, while an execution-dependent hash requires running the candidate
-inside the rollback context from proposal 1. A pre-call hash alone cannot distinguish
-a local write that leaves the host rolling hash unchanged. Also distinguish
-alternative candidates from sequential calls in an array: skipping a required
-sequential call must not become a successful lookup.
-
-Each `ExpectedL1ToL2Call` or `ExecutionEntry` would carry arrays of alternative
-`success` values and `returnData`, instead of one result pair, with equivalent
-changes on L2. Their lengths and indexing must agree. The validated branch must
-select exactly one pair and bind it to that branch's callbacks, hash checks and,
-where applicable, root/ether transitions in the proof. An explicit outcome index or
-paired outcome structure can express this association; array order alone does not
-explain which result is valid. An occurrence counter that rolls back with the caller
-would reproduce the existing retry problem.
-
-This allows one lookup identity to represent multiple validated outcomes. It still
-requires a discriminator for those outcomes; adding arrays alone cannot distinguish
-the gas-sensitive example whose callback hashes are both zero.
-
-### 3. Include exact gas in call identity
-
-Differentiate otherwise identical calls using gas at a precisely defined observation
-point. L2 already has outgoing observed-gas keying through `USE_GAS_LEFT`; extending
-this approach to L1 would strengthen the requirement that simulation and settlement
-reproduce the same gas value. Define whether the discriminator is a supplied cap or
-observed remaining gas: those are different quantities and must not be conflated.
-
-This can distinguish occurrences whose gas values differ, including some reads
-without callbacks. It requires agreement on the measurement point, forwarding,
-wrapper overhead, access warmth and preceding execution. Candidate retries themselves
-spend gas, so combining this approach with proposal 1 requires modeling that work.
-
-Exact gas is not a universal occurrence identifier: separate calls can use the same
-cap or arrive at the observation point with the same remaining gas. Conversely, a
-small simulation/settlement gas difference can prevent an otherwise valid lookup.
-The guarantee therefore needs an explicit supported execution model and a policy
-for collisions; it cannot be stated as “every call is perfectly recognizable.”
-
-All three proposals should be checked against the existing mutable retry,
-parent-rollback, gas-sensitive static and fixed-budget counterexamples. New tests
-must also cover rejected attempts leaving no state/value effects, valid application
-reverts remaining terminal, and incorrect hash/outcome associations being rejected.
+Validate against the existing mutable retry, parent-rollback, gas-sensitive static
+and fixed-budget counterexamples. New tests must also cover rejected attempts
+leaving no state/value effects, valid application reverts remaining terminal, and
+incorrect hash/outcome associations being rejected. The nested regression checklist
+below remains required even if the top-level retry tests pass.
 
 ## Regression checklist: successful nested calls after parent rollback
 

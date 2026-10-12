@@ -294,6 +294,13 @@ hint is available, `eth_getBlockReceipts(blockHash)` can recover the receipt by
 transaction hash. Receipt status and canonical block hash are still checked.
 Calldata may be cached by transaction hash; receipt block numbers are not cached.
 
+For discovered L2 delivery blocks, verification reads `eth_getBlockReceipts` once
+per exact block hash and selects all required transactions. Each selected receipt
+must be unique, have a valid status, and match the canonical header; the usual
+success and final canonical checks still apply. These receipts are reused only
+within that verification pass. Unsupported, missing or invalid block receipts
+fall back to the individual transaction-receipt path.
+
 L2 discovery uses the existing Forge `VerifyL2CallsInRange` scanner: one
 `eth_getLogs` range query per attempt finds the expected call hashes. Matched
 settlements bound the range, and matches must belong to those settlements.
