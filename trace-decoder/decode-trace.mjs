@@ -3,23 +3,11 @@
 // Cross-chain trace decoder — unified view
 // ═══════════════════════════════════════════════════════════════════════
 //
-// Given a tx hash, produces a unified cross-chain execution flow
-// joining L1 and L2 traces into one diagram. Events at the end.
-//
-// Usage:
-//   node decode-trace.mjs --tx <HASH> --l1-rpc <RPC> --l2-rpc <RPC>
-//     [--l1-explorer <URL>] [--l2-explorer <URL>] [--no-explorer]
-//
-// EEZ (L1) / EEZL2 addresses are auto-discovered from the trace
-// (the contract receiving executeCrossChainCall). Env vars with
-// 0x addresses are auto-picked up as labels.
-//
-// Current EEZ/EEZL2 ABIs come from local artifacts. Top-level event lists use
-// committed receipt logs; call-tree logs are explicitly marked as trace evidence.
-// Cross-chain hash matches are candidates, not occurrence identities. Different gas
-// policies can prevent a match. Batch callData is application-defined: the optional
-// block-reference decoder recognizes abi.encode(uint256[], bytes[]) only. Empty or
-// other payloads, and internal posts through wrappers, leave block joins unresolved.
+// CLI: node trace-decoder/decode-trace.mjs <HASH> [--env-file chain.envdevnet]
+// Engine API: decodeCrossChainTrace(config, hash), exported below.
+// The CLI uses engine.mjs, config.mjs, and logical.mjs. The original helper
+// exports remain here for callers and the existing compatibility regressions;
+// they are not the new engine's discovery, decoding, or matching implementation.
 
 import { ethers } from "ethers";
 import fs from "fs";
@@ -52,8 +40,8 @@ function parseArgs() {
     l2Rpc: "",
     rollups: "",    // auto-discovered from trace
     managerL2: "",  // auto-discovered from trace
-    l1Explorer: "https://l1.eez.dev",
-    l2Explorer: "https://l2.eez.dev",
+    l1Explorer: "https://l1-explorer.example.net",
+    l2Explorer: "https://l2-explorer.example.net",
     noExplorer: false,
     json: false,
   };
@@ -1109,57 +1097,17 @@ function bigintReplacer(_key, value) {
 // ══════════════════════════════════════════════
 
 async function main() {
-  const opts = parseArgs();
-
-  const l1 = new ethers.JsonRpcProvider(opts.l1Rpc);
-  const l2 = new ethers.JsonRpcProvider(opts.l2Rpc);
-
-  // Load ABIs
-  const outDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../out");
-  if (!opts.json) console.log(c.dim("Loading ABIs from " + outDir + "..."));
-  loadLocalABIs(outDir);
-  if (!opts.json) console.log(c.dim(`Loaded ${selectorToIface.size} selectors, ${topicToIface.size} event topics`));
-  buildLabels(opts);
-
-  const result = await traceTransaction(opts.tx, l1, l2, opts, { silent: opts.json });
-
-  if (result.chain === "L1") {
-    if (opts.json) {
-      const response = buildJsonResponse(result.l1Trace, result.l2Traces, result.l1Receipt, result.opts, result.l2Receipts);
-      response.blockContext = {
-        l1Block: result.l1Receipt.blockNumber,
-        l2Blocks: result.l2Blocks,
-        batchTxHash: result.batchTxs.length === 1 ? result.batchTxs[0] : null,
-        batchTxHashes: result.batchTxs,
-      };
-      console.log(JSON.stringify(response, bigintReplacer, 2));
-    } else {
-      renderUnified(result.l1Trace, result.l2Traces, result.l1Receipt, result.l2Receipts, result.opts);
-    }
-  } else {
-    if (opts.json) {
-      const callTree = serializeCallNode(result.l2Trace, "L2", [], opts);
-      const events = decodeReceiptLogs(result.l2Receipt).filter(dl => dl.name).map(dl => serializeEvent(dl, "L2"));
-      const response = {
-        txHash: opts.tx,
-        chain: "L2",
-        blockNumber: result.l2Receipt.blockNumber,
-        status: result.l2Receipt.status === 1 ? "success" : "revert",
-        from: result.l2Receipt.from,
-        to: result.l2Receipt.to,
-        callTree,
-        events,
-        blockContext: null,
-        systemContracts: { rollups: opts.rollups || null, managerL2: opts.managerL2 || null },
-      };
-      console.log(JSON.stringify(response, bigintReplacer, 2));
-    } else {
-      console.log("");
-      console.log(c.bold("L2 Trace:"));
-      printCallTree(result.l2Trace, 0);
-    }
-  }
+  const { loadConfig, HELP } = await import("./src/config.mjs");
+  const { decodeCrossChainTrace } = await import("./src/engine.mjs");
+  const { renderTrace } = await import("./src/logical.mjs");
+  const config = loadConfig();
+  if (config.help) { console.log(HELP); return; }
+  config.onDiagnostic = item => console.error(`[${item.code}] ${item.message}`);
+  const result = await decodeCrossChainTrace(config, config.tx);
+  console.log(config.json ? JSON.stringify(result, bigintReplacer, 2) : renderTrace(result, config));
 }
+
+export { decodeCrossChainTrace } from "./src/engine.mjs";
 
 function printCallTree(node, depth) {
   const indent = "  ".repeat(depth);

@@ -20,7 +20,8 @@ import {
     noL2OutgoingCalls,
     noL2StaticEntries,
     immediateSingleRollupBatch,
-    RollingHashBuilder
+    RollingHashBuilder,
+    HashStep
 } from "../../../shared/E2EHelpers.sol";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -49,6 +50,14 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract RevertL2Actions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    function _l1Steps(address revCounterL1, address safeCallerL2) internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](2);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1CallHash(revCounterL1, safeCallerL2));
+        steps[0][1] = RollingHashBuilder.stepCallEnd(false, _revertData());
+    }
+
     function _incrementCallData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(Counter.increment.selector);
     }
@@ -273,6 +282,7 @@ contract ComputeExpected is ComputeExpectedBase, RevertL2Actions {
         console.log("EXPECTED_L1_HASHES=[%s]", vm.toString(_entryHash(l1[0])));
         // NOTE: no EXPECTED_L2_CALL_HASHES — a success=false entry's consumption reverts,
         // unwinding its events; the loaded-table comparison pins it on L2 instead.
+        _printL1Steps(l1, _l1Steps(revCounterL1, safeCallerAddr));
         _printL1Table(l1);
         _printL2Table(l2);
         console.log("");

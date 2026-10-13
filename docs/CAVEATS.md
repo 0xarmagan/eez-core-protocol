@@ -3,7 +3,8 @@
 ## Calling through cross-chain proxies
 
 - **Opcodes that differ on cross-chain proxies**:
-  - These opcodes return information about the proxy itself, not the proxied contract: `delegatecall`, `balance`, `extcodesize`, `extcodecopy`.
+  - `BALANCE`, `EXTCODESIZE`, `EXTCODECOPY`, and `EXTCODEHASH` inspect the local proxy account, not the remote contract.
+  - `DELEGATECALL` executes the proxy bytecode in the caller's context; it does not execute remote contract code locally or preserve the normal manager/proxy authorization path.
   - Block-state opcodes (`blocknumber`, `blockhash`, `blockgaslimit`, `chainid`, `coinbase`, …) reflect the chain the call is executing on, not the source chain — values will differ when the same logical action is observed on L1 vs L2.
 
 - **Proxy self-calls:** A proxy calling itself with `staticCheck()` runs its internal detector instead of making a cross-chain call.
@@ -14,6 +15,8 @@
 
 ## Delivery and execution semantics
 
+L1 ordering of deferred entries is defined in the core protocol's [Settlement Model](CORE_PROTOCOL_SPEC.md#settlement-model).
+
 - **Gas-budget checks are estimates:** Both L1 and L2 check `_hasEnoughCallGas` before dispatching calls with non-zero `gas`. A detected shortage stops the local call array and folds `CALL_INSUFFICIENT_GAS` into the rolling hash; valid proofs must exclude that marker, so hash validation rejects executions that retain it. An ordinary enclosing revert can erase the marker. Static-entry execution instead reverts with `InsufficientCallGas`. The estimate excludes account-creation costs, return-data processing, and the rest of the entry, so it is not an unconditional gas-delivery or completion guarantee. A `gas` value of `0` skips the check and forwards available gas subject to EVM forwarding limits. Posters must still fund the whole batch.
 
 - **Posting does not guarantee delivery of every entry:** Consumption scans forward and permanently skips non-matching entries. During the meta hook, all rollups share one cursor: a third-party operation calling `executeL2Txs(G)` can consume a later G entry and skip pending entries for H, causing H's calls to fail with `ExecutionNotFound`. If the hook catches those failures and returns successfully, the skipped immediate entries are discarded; if it reverts, the whole post rolls back. Executed entries still require valid starting roots and execution checks. Only leading immediate L2Tx entries run automatically; later ones require an explicit `executeL2Txs` call.
@@ -22,7 +25,11 @@
 
 - **Composer-controlled delivery:** The composer can withhold a batch or, when it controls the posting contract, leave optional entries unexecuted. Including execution settings in the proof would not force it to do that work, though it could stop another submitter from changing those settings. Entries that execute must still pass the existing checks. Applications that require particular entries to run must enforce that requirement themselves.
 
-- **L2 retries reuse the first matching result:** A failed entry restores the cursor, so retrying the same call hash hits the same row; a later row for that hash is only reachable after another successful consumption. The node must refresh tables when state or other dependencies invalidate their cached results. A transaction boundary alone does not require reloading: reuse is allowed while results and lookup contexts remain valid, subject to the manager's same-block gate.
+- **Mutable retries after a revert are limited on both L1 and L2:** If a call reverts, or succeeds and an enclosing application call later reverts, the table cursor and relevant hash/root updates roll back. Changing local state and repeating the same call can therefore select the old row again. Mutable lookups do not try another matching row after a hash mismatch, so a valid retry can fail. Candidate retries are not implemented; experiments are planned, and whether to implement them remains undecided. See [call-pattern limits](CALL_PATTERN_LIMITS.md#1-mutable-call-revert-local-write-identical-retry).
+
+- **A nested retry may return an old saved answer:** After an enclosing revert, a successful nested call can reuse a row whose callbacks read the new state but whose saved answer belongs to the old state. The successful nested closing hash does not include that answer, so the outer hash may still match if the wrong answer affects only state not reflected in the hashed calls/results. This is a source-level concern awaiting a dedicated reproduction and production-proof validation; retry support must not be assumed. See the [example and validation checklist](CALL_PATTERN_LIMITS.md#a-successful-nested-retry-can-return-a-stale-answer-without-a-hash-mismatch).
+
+- **L2 table refresh responsibilities:** A reverted entry restores the cursor, so retrying the same call hash in the same loaded table selects the same first matching row. A later row becomes reachable after a committed cursor advance or table replacement. The node must refresh tables when state or other dependencies invalidate their cached results. A transaction boundary alone does not require reloading: reuse is allowed while results and lookup contexts remain valid, subject to the manager's same-block gate.
 
 - **Static candidates must be distinguishable:** L1/L2 static lookups select the first candidate whose callback-result hash matches, supporting local writes without changing the cursor, root pins or rolling hash. Identical full execution inputs must produce identical outcomes. Ambiguity arises when a differing dependency, such as gas, is not distinguished by the lookup; builders must reject or restructure conflicting candidates. Retrying callbacks costs gas, and gas alone is not a reliable state identifier.
 

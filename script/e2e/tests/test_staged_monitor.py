@@ -1,4 +1,5 @@
 """Run the real Bash monitor against deterministic receipt endpoints and a fake clock."""
+import json
 import os
 from pathlib import Path
 import re
@@ -17,7 +18,8 @@ def function(name):
 
 
 FUNCTIONS = "\n".join(function(name) for name in (
-    "_remove_mined", "_poll_pending_once", "_chain_counts", "_monitor_files"))
+    "_expects_missing_proxy_rejection", "_check_missing_proxy_rejection",
+    "_poll_expected_rejections", "_remove_mined", "_poll_pending_once", "_chain_counts", "_monitor_files"))
 DEFAULT = re.search(r'^MAX_MONITOR_WAIT=.*$', RUNNER, re.M).group()
 
 
@@ -114,7 +116,7 @@ _monitor_files sent.csv mined.csv pending.csv "${RECOVERY_INTERVAL:-2}" "$MODE" 
     def test_both_chains_share_one_progress_line(self):
         result, _ = self.run_monitor()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("[trigger] L1: 1/1 mined (0 pending) | L2: 1/1 mined (0 pending)", result.stdout)
+        self.assertIn("[trigger] L1: 1/1 resolved (0 pending) | L2: 1/1 resolved (0 pending)", result.stdout)
 
     def test_rejected_transactions_stop_without_rebroadcast(self):
         result, files = self.run_monitor(MINE_AT=999, REJECTED=1)
@@ -142,6 +144,94 @@ _monitor_files sent.csv mined.csv pending.csv "${RECOVERY_INTERVAL:-2}" "$MODE" 
         result, files = self.run_monitor(RECONCILE_RC=1)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertNotIn("lookups", files)
+
+
+class StagedRejectionTests(unittest.TestCase):
+    def status(self):
+        return {
+            "hash": "0xaaa", "lifecycle": "terminal",
+            "ownership": {
+                "state": "terminal", "reason": "SimulationFailed",
+                "rejection": {"error": "executor: static callback source proxy 0x" + "a" * 40
+                              + " is not deployed on chain 1; it must exist before the read"},
+            },
+        }
+
+    def run_check(self, chain, status, **settings):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "status.json").write_text(json.dumps(status))
+            script = r"""
+set -euo pipefail
+cd "$TEST_ROOT"
+L1_RPC=direct1 L2_RPC=direct2
+_front_rpc() { [[ "$1" == L1 ]] && echo front1 || echo front2; }
+cast() {
+    [[ "$1 $2 $3 $4" == 'rpc --rpc-timeout 10 --rpc-url' && "$7" == 0xaaa ]] || return 90
+    echo "$5 $6 $7" >> calls
+    case "$6" in
+        eez_getCrossChainTransaction)
+            [[ "$5" == "$EXPECTED_FRONT" && "${LOOKUP_FAIL:-0}" != 1 ]] || return 91
+            cat status.json ;;
+        eth_getTransactionReceipt)
+            [[ "$5" == "$EXPECTED_FRONT" || "$5" == "$EXPECTED_DIRECT" ]] || return 92
+            if [[ "$5" == "${MINED_ENDPOINT:-none}" ]]; then
+                echo '{"status":"0x0"}'
+            else
+                echo null
+            fi ;;
+        *) return 93 ;;
+    esac
+}
+""" + function("_check_missing_proxy_rejection") + r"""
+_check_missing_proxy_rejection "$CHAIN" 0xaaa evidence.json
+"""
+            suffix = "1" if chain == "L1" else "2"
+            result = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=10,
+                env={"PATH": os.environ["PATH"], "TEST_ROOT": directory, "CHAIN": chain,
+                     "EXPECTED_FRONT": "front" + suffix, "EXPECTED_DIRECT": "direct" + suffix,
+                     **settings})
+            files = {p.name: p.read_text() for p in root.iterdir()}
+            return result, files
+
+    def test_status_uses_matching_front_and_receipts_check_both_endpoints(self):
+        for chain, suffix in (("L1", "1"), ("L2", "2")):
+            with self.subTest(chain=chain):
+                status = self.status()
+                result, files = self.run_check(chain, status)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(files["calls"].splitlines(), [
+                    f"front{suffix} eez_getCrossChainTransaction 0xaaa",
+                    f"direct{suffix} eth_getTransactionReceipt 0xaaa",
+                    f"front{suffix} eth_getTransactionReceipt 0xaaa",
+                ])
+                self.assertEqual(json.loads(files["evidence.json"]), status)
+
+    def test_null_wrong_hash_nonterminal_and_unrelated_rejections_fail(self):
+        statuses = [None]
+        for field, value in (("hash", "0xbbb"), ("lifecycle", "pending")):
+            status = self.status()
+            status[field] = value
+            statuses.append(status)
+        for field, value in (("reason", "OtherFailure"), ("state", "pending"),
+                             ("rejection", {"error": "some other simulation failure"})):
+            status = self.status()
+            status["ownership"][field] = value
+            statuses.append(status)
+        for chain in ("L1", "L2"):
+            for status in statuses:
+                with self.subTest(chain=chain, status=status):
+                    result, _ = self.run_check(chain, status)
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_rpc_failure_or_receipt_at_either_endpoint_cannot_pass(self):
+        for chain, suffix in (("L1", "1"), ("L2", "2")):
+            for settings in ({"LOOKUP_FAIL": "1"}, {"MINED_ENDPOINT": "front" + suffix},
+                             {"MINED_ENDPOINT": "direct" + suffix}):
+                with self.subTest(chain=chain, settings=settings):
+                    result, _ = self.run_check(chain, self.status(), **settings)
+                    self.assertNotEqual(result.returncode, 0)
 
 
 if __name__ == "__main__":

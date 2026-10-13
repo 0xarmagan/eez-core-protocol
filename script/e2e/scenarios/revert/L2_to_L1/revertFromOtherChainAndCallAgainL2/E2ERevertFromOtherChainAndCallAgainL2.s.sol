@@ -20,7 +20,8 @@ import {
     noL2OutgoingCalls,
     noL2StaticEntries,
     immediateSingleRollupBatch,
-    RollingHashBuilder
+    RollingHashBuilder,
+    HashStep
 } from "../../../shared/E2EHelpers.sol";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -52,6 +53,18 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract RevertFromOtherChainAndCallAgainL2Actions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    ///      The deliberate rollback span preserves the first successful call's folds.
+    ///      Its state unwinds, so the retry also returns 1.
+    function _l1Steps(address counterL1, address selfCallerL2) internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](4);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1CallHash(counterL1, selfCallerL2));
+        steps[0][1] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+        steps[0][2] = RollingHashBuilder.stepCallBegin(_l1CallHash(counterL1, selfCallerL2));
+        steps[0][3] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+    }
+
     function _incrementData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(Counter.increment.selector);
     }
@@ -278,6 +291,7 @@ contract ComputeExpected is ComputeExpectedBase, RevertFromOtherChainAndCallAgai
         console.log("EXPECTED_L1_HASHES=[%s]", vm.toString(_entryHash(l1[0])));
         // Only the SURVIVING consumption leaves an ExecutionConsumed event on L2.
         console.log("EXPECTED_L2_CALL_HASHES=[%s]", vm.toString(l2[0].proxyEntryHash));
+        _printL1Steps(l1, _l1Steps(counterL1, selfCallerL2));
         _printL1Table(l1);
         _printL2Table(l2);
         console.log("");

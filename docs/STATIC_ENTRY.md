@@ -1,8 +1,9 @@
 # Static Entry Specification
 
-This document specifies how **read-only cross-chain calls** (STATICCALLs) and **pre-verified
-reverting calls** resolve — every cross-chain interaction whose result is *looked up* from
-prover-supplied data instead of returned by a live top-level `ExecutionEntry` success path.
+This document specifies **read-only cross-chain calls** (STATICCALLs) and the related
+resolution of **reverting mutable reentrant calls**. Both return or revert with prepared
+outcomes after checking their local callbacks; successful mutable paths also use cached
+remote outcomes and are described in `EXECUTION_ENTRY_SPEC.md`.
 
 There are **two homes**, split by execution context:
 
@@ -43,7 +44,9 @@ This document complements `EXECUTION_ENTRY_SPEC.md` (how `ExecutionEntry`s are b
 A contract performs a cross-chain read by STATICCALLing the counterparty's `CrossChainProxy`.
 The proxy detects the static frame itself (`CrossChainProxy._fallback`): it self-calls
 `staticCheck()`, which attempts a transient store — `tstore` reverts inside a STATICCALL, so a
-failed self-call means "static context". The proxy then routes to the manager's
+failed self-call selects static routing. The probe uses the manager's
+`STATIC_CHECK_GAS` cap (currently 1,000); insufficient probe gas can also make it fail.
+The proxy then routes to the manager's
 `staticCrossChainCall(msg.sender, msg.data)` via STATICCALL (a normal frame routes to
 `executeCrossChainCall` instead).
 
@@ -131,9 +134,10 @@ candidate's callback-result hash and skips a mismatch. It cannot advance the cur
 (it is a `view` frame), so later reads can reuse any valid row at or after that cursor,
 including an earlier candidate skipped by a previous read.
 
-Completeness is enforced by the rolling hash, not by a table-length check: the unified table
-mixes success rows with static/reverted ones, so unused rows are inert, while a *skipped*
-success row omits its NESTED frame and diverges the entry hash.
+There is no table-length check: unused rows are inert. Omitting an expected surviving
+mutable frame changes the entry hash by omitting its NESTED folds. That does not identify
+a unique row occurrence or retain observations erased by an ordinary enclosing revert;
+see [call-pattern limits](CALL_PATTERN_LIMITS.md).
 
 ---
 
@@ -151,8 +155,10 @@ success row omits its NESTED frame and diverges the entry hash.
 3. On match → `_resolveStaticEntry(l2ToL1Calls, revertedOrStaticRollingHash, success,
    returnData)` (§4.3); if it returns false, continue scanning. On no match → `ExecutionNotFound` on L1, `EntryNotFound(hash, callGas)`
    on L2 (a `view` frame cannot fold a
-   `CALL_NOT_FOUND` divergence, so it reverts directly — unlike a reentrant CALL no-match,
-   which folds the tag and returns empty so the entry fails later at `RollingHashMismatch`).
+   `CALL_NOT_FOUND` divergence, so it reverts directly). A reentrant mutable CALL no-match
+   instead folds the tag and returns success with empty bytes. Against an honest expected
+   hash it causes `RollingHashMismatch` only if the marker survives to validation; an
+   ordinary enclosing revert can erase it. See [the reverted-probe caveat](CAVEATS.md#edge-cases).
 
 **Reverted reentrant call** — `_consumeNestedCall` → `_resolveNestedReentrant`, `success == false`
 row:
@@ -169,8 +175,9 @@ The terminal revert rolls back the sub-execution's **state**, the cursor advance
 rolling-hash writes in one shot (all transient/storage writes of the frame unwind with the
 EVM revert); the caller's `try/catch` observes exactly `returnData`. A `success == true` row
 takes the other branch of the same resolver: it closes the frame with `NESTED_END` into the
-host's *continuous* hash and returns `returnData` — that path is a plain reentrant call, not a
-lookup, and is specified in `EXECUTION_ENTRY_SPEC.md`.
+host's *continuous* hash and returns the cached `returnData`. This mutable path requires
+zero `revertedOrStaticRollingHash` and is specified in `EXECUTION_ENTRY_SPEC.md`; it has no
+candidate-specific callback-hash check for successful rows.
 
 ### 4.2 Top-level (outside any execution)
 
@@ -242,6 +249,7 @@ revert is terminal, and sub-call validation errors still revert immediately.
   STATICCALL frame, and a STATICCALL to a codeless address silently returns `(true, "")` — so
   a codeless proxy reverts `StaticCallProxyNotDeployed` rather than letting the prover
   pre-hash a no-op.
+- A callback targeting the runtime manager itself is rejected with `EEZDestinationForbidden`, before the other sub-call checks.
 - Every sub-call must be marked `isStatic` with `value == 0` — dispatch is read-only whatever
   the fields say, and the untagged hash folds neither, so a mismatch reverts (`NonStaticSubCall`
   / `StaticCallWithValue`) instead of silently executing a proven state-changing call read-only.
@@ -427,8 +435,10 @@ static entries flow to the persistent `staticEntryQueue`s.
 
 ## 8. Invariants (summary)
 
-- `success == false` ⇒ resolution ends in `revert(returnData)`; `success == true` ⇒ it
-  returns `returnData`. Same polarity on `ExecutionEntry`, `ExpectedL1ToL2Call`, and
+- Once lookup and validation succeed, `success == false` ⇒ resolution ends in
+  `revert(returnData)`; `success == true` ⇒ it returns `returnData`. Earlier validation
+  errors can abort either path; a static callback-hash mismatch instead skips the
+  candidate. Same polarity on `ExecutionEntry`, `ExpectedL1ToL2Call`, and
   `StaticExecutionEntry`.
 - A static read never mutates: STATICCALL dispatch, untagged hash, no cursor advance, no
   proxy auto-creation (`StaticCallProxyNotDeployed` on a codeless proxy), no
@@ -444,9 +454,12 @@ static entries flow to the persistent `staticEntryQueue`s.
   past it), a static read does not.
 - A REVERTED resolution runs its own sub-array with the tagged schema inside NESTED_BEGIN,
   checks the sub-hash, then terminal-reverts — state, cursor, and hash all roll back with it.
-- No-match asymmetry: a reentrant CALL no-match folds `CALL_NOT_FOUND` and returns `""` (the
-  entry fails at its rolling-hash check); a static no-match reverts immediately, in both
-  branches — `ExecutionNotFound` on L1, `EntryNotFound(hash, callGas)` on L2.
+- No-match asymmetry: a reentrant mutable CALL no-match folds `CALL_NOT_FOUND` and returns
+  success with empty bytes. Against an honest expected hash, a surviving marker rejects the
+  entry at hash validation, but an ordinary enclosing revert can erase it. Explicit rollback
+  spans transport their hash through `ContextResult`. A static no-match reverts immediately
+  in both branches — `ExecutionNotFound` on L1, `EntryNotFound(hash, callGas)` on L2. Empty
+  success observed through a reverted probe is not evidence of remote approval.
 - L1 top-level match = `proxyEntryHash` + `destinationRollupId` + all pins live; full-scan
   skip semantics. Every re-verify of the rollup resets `staticEntryQueueIndex` to zero without deleting `staticEntryQueue` mapping entries. Publishing overwrites slots from index zero; lookups scan only below the active bound.
 - Validation (L1): pins strictly increasing and in-batch; `destinationRollupId` ∈ pins;

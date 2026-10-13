@@ -34,6 +34,7 @@ import {
     noL2Calls,
     getOrCreateProxy,
     RollingHashBuilder,
+    HashStep,
     immediateSingleRollupBatch
 } from "../../../shared/E2EHelpers.sol";
 
@@ -73,6 +74,19 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract MCNActions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    ///      The third entry is seed-only: its counter executes entirely on L2.
+    function _l1Steps(address counterL1, address cap2L2) internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](3);
+        steps[0] = new HashStep[](2);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1TopCallCounterL1(counterL1, cap2L2));
+        steps[0][1] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+        steps[1] = new HashStep[](2);
+        steps[1][0] = RollingHashBuilder.stepCallBegin(_l1TopCallCounterL1(counterL1, cap2L2));
+        steps[1][1] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(2)));
+        steps[2] = new HashStep[](0); // seed only
+    }
+
     function _incrementProxyData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(CounterAndProxy.incrementProxy.selector);
     }
@@ -517,6 +531,7 @@ contract ComputeExpected is ComputeExpectedBase, MCNActions {
         );
         _printL1CallHashes(l1);
         _printL2CallHashes(l2);
+        _printL1Steps(l1, _l1Steps(counterL1, cap2));
         _printL1Table(l1);
         _printL2Table(l2);
 

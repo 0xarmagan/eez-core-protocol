@@ -18,11 +18,20 @@ class SettlementTargetTests(unittest.TestCase):
         env = {
             "PATH": os.environ["PATH"], "TARGET": BATCHER, "BOUND": REGISTRY,
             "ROLLUPS": REGISTRY, "RPC": "fixture-rpc", "EEZ_POST_BATCHER": "",
-            "HELPER": str(E2E / "lib/settlement-target.sh"), **settings,
+            "HELPER": str(E2E / "lib/settlement-target.sh"),
+            "EVIDENCE": str(E2E / "lib/network-evidence.sh"), **settings,
         }
         script = r"""
 set -euo pipefail
 source "$HELPER"
+source "$EVIDENCE"
+NETWORK_VERIFY_DEADLINE=$(( $(date +%s) + 60 ))
+L1_BATCH_TXS=()
+network_receipt() {
+    jq -nc --arg to "$TARGET" '{to:$to,blockNumber:"0x7b",status:"0x1"}'
+}
+network_track_receipt() { return 0; }
+network_transaction_input() { cast tx "$2" input; }
 cast() {
     case "$1" in
         call)
@@ -47,7 +56,7 @@ forge() {
 """
         if phase:
             script += r"""
-EXPECTED_L1_TABLE=0x01 EXPECTED_L1_STATIC_TABLE=0x EXPECTED_L1_STEPS=0x
+EXPECTED_L1_TABLE=0x01 EXPECTED_L1_STATIC_TABLE=0x EXPECTED_L1_STEPS="${STEP_BLOB:-0x}"
 _HAS_COMPUTE=true EXPECTED_L1_CALL_HASHES='[]' L1_BATCH_TX=0xtx
 L1_VERIFY='' _CORR_TX='' _TRIGGER_CHAIN="${TRIGGER_CHAIN:-L1}"
 _L1_CONTRACT=VerifyL1BatchInRange
@@ -115,6 +124,14 @@ verify_settlement_target fixture-rpc 123 "$TARGET" "$ROLLUPS"
                     self.assertIn("Matched settlement tx 0xtx", result.stdout)
                     self.assertIn('DECODE script', result.stdout)
                     self.assertIn(f"0xe4a480e400 {REGISTRY} 0x01 0x 0x false", result.stdout)
+
+    def test_calldata_phase_forwards_expected_steps_in_both_directions(self):
+        for chain in ("L1", "L2"):
+            with self.subTest(chain=chain):
+                result = self.run_check(phase=True, TRIGGER_CHAIN=chain, STEP_BLOB="0x1234abcd")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("FAILED=false", result.stdout)
+                self.assertIn(f"0xe4a480e400 {REGISTRY} 0x01 0x1234abcd 0x false", result.stdout)
 
     def test_rejected_or_missing_candidates_cannot_pass_in_either_direction(self):
         for settings in ({"BOUND": OTHER}, {"GETTER_FAIL": "1"}, {"INPUT": "0x"},

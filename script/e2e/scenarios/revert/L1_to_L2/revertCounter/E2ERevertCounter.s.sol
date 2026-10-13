@@ -15,6 +15,7 @@ import {
     noNestedActions,
     noCalls,
     RollingHashBuilder,
+    HashStep,
     immediateSingleRollupBatch
 } from "../../../shared/E2EHelpers.sol";
 
@@ -49,6 +50,13 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract RevertActions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    ///      The failed L2 call has no L1 callbacks; its L1 entry hash is seed-only.
+    function _l1Steps() internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](0); // seed only
+    }
+
     function _incrementCallData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(Counter.increment.selector);
     }
@@ -213,6 +221,7 @@ contract ComputeExpected is ComputeExpectedBase, RevertActions {
         console.log("EXPECTED_L2_HASHES=[]");
         console.log("EXPECTED_L2_CALL_HASHES=[]");
         console.log("ABSENT_L2_HASHES=[%s]", vm.toString(l1[0].proxyEntryHash));
+        _printL1Steps(l1, _l1Steps());
         _printL1Table(l1);
         console.log("");
         console.log("=== EXPECTED L1 TABLE (1 entry, no calls, success=false: signed destination revert) ===");

@@ -5,7 +5,12 @@ import {Script, console} from "forge-std/Script.sol";
 import {EEZ} from "../../../../../../src/EEZ.sol";
 import {EEZL2} from "../../../../../../src/L2/EEZL2.sol";
 import {IEEZ} from "../../../../../../src/interfaces/IEEZ.sol";
-import {RollupUpdate, L2ToL1Call, ExecutionEntry, StaticExecutionEntry} from "../../../../../../src/interfaces/IEEZ.sol";
+import {
+    RollupUpdate,
+    L2ToL1Call,
+    ExecutionEntry,
+    StaticExecutionEntry
+} from "../../../../../../src/interfaces/IEEZ.sol";
 import {
     ExecutionEntry as L2ExecutionEntry,
     StaticExecutionEntryL2 as L2StaticExecutionEntry,
@@ -25,6 +30,7 @@ import {
     noL2Calls,
     getOrCreateProxy,
     RollingHashBuilder,
+    HashStep,
     immediateSingleRollupBatch
 } from "../../../shared/E2EHelpers.sol";
 
@@ -55,6 +61,14 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract NestedActions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    function _l1Steps(address counterL1, address capL2) internal pure returns (HashStep[][] memory steps) {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](2);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1TopCallHash(counterL1, capL2));
+        steps[0][1] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+    }
+
     /// Outer/trigger hash (proxyEntryHash on BOTH sides): alice on L1 calls capL2 on L2
     /// through the L1-side proxy. The inbound delivery keys on the same hash.
     function _outerHash(address capL2, address alice) internal pure returns (bytes32) {
@@ -357,6 +371,7 @@ contract ComputeExpected is ComputeExpectedBase, NestedActions {
         console.log("EXPECTED_L2_HASHES=[%s]", vm.toString(l2Hash));
         console.log("EXPECTED_L1_CALL_HASHES=[%s]", vm.toString(l1[0].proxyEntryHash));
         console.log("EXPECTED_L2_CALL_HASHES=[%s]", vm.toString(l2[0].proxyEntryHash));
+        _printL1Steps(l1, _l1Steps(counterL1Addr, capL2Addr));
         _printL1Table(l1);
         _printL2Table(l2);
 

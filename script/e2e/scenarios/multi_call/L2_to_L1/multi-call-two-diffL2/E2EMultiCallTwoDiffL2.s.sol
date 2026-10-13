@@ -21,7 +21,8 @@ import {
     noL2OutgoingCalls,
     noL2StaticEntries,
     immediateSingleRollupBatch,
-    RollingHashBuilder
+    RollingHashBuilder,
+    HashStep
 } from "../../../shared/E2EHelpers.sol";
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -47,6 +48,24 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract MultiCallTwoDiffL2Actions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    function _l1Steps(
+        address counterA,
+        address counterB,
+        address callerL2
+    )
+        internal
+        pure
+        returns (HashStep[][] memory steps)
+    {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](4);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1CallHash(counterA, callerL2));
+        steps[0][1] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+        steps[0][2] = RollingHashBuilder.stepCallBegin(_l1CallHash(counterB, callerL2));
+        steps[0][3] = RollingHashBuilder.stepCallEnd(true, abi.encode(uint256(1)));
+    }
+
     function _incrementCallData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(Counter.increment.selector);
     }
@@ -282,6 +301,7 @@ contract ComputeExpected is ComputeExpectedBase, MultiCallTwoDiffL2Actions {
         console.log(
             "EXPECTED_L2_CALL_HASHES=[%s,%s]", vm.toString(l2[0].proxyEntryHash), vm.toString(l2[1].proxyEntryHash)
         );
+        _printL1Steps(l1, _l1Steps(counterA, counterB, callerL2));
         _printL1Table(l1);
         _printL2Table(l2);
 

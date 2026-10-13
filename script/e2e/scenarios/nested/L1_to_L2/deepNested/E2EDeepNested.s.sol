@@ -30,6 +30,7 @@ import {
     noCalls,
     getOrCreateProxy,
     RollingHashBuilder,
+    HashStep,
     immediateSingleRollupBatch
 } from "../../../shared/E2EHelpers.sol";
 
@@ -63,6 +64,20 @@ uint64 constant L2_ROLLUP_ID = 1;
 uint64 constant MAINNET_ROLLUP_ID = 0;
 
 abstract contract DeepNestedActions {
+    /// @dev Expected L1 folds, in entry order, independent of the posted seed roots.
+    function _l1Steps(address counterL2, address capL1, address ncL2)
+        internal
+        pure
+        returns (HashStep[][] memory steps)
+    {
+        steps = new HashStep[][](1);
+        steps[0] = new HashStep[](4);
+        steps[0][0] = RollingHashBuilder.stepCallBegin(_l1TopCallHash(capL1, ncL2));
+        steps[0][1] = RollingHashBuilder.stepNestedBegin(_innerHash(counterL2, capL1));
+        steps[0][2] = RollingHashBuilder.stepNestedEnd();
+        steps[0][3] = RollingHashBuilder.stepCallEnd(true, "");
+    }
+
     function _callNestedData() internal pure returns (bytes memory) {
         return abi.encodeWithSelector(NestedCaller.callNested.selector);
     }
@@ -400,6 +415,7 @@ contract ComputeExpected is ComputeExpectedBase, DeepNestedActions {
         console.log("EXPECTED_L2_HASHES=[%s]", vm.toString(_entryHash(l2[0])));
         console.log("EXPECTED_L1_CALL_HASHES=[%s]", vm.toString(l1[0].proxyEntryHash));
         console.log("EXPECTED_L2_CALL_HASHES=[%s]", vm.toString(l2[0].proxyEntryHash));
+        _printL1Steps(l1, _l1Steps(counterL2Addr, capL1Addr, ncL2Addr));
         _printL1Table(l1);
         _printL2Table(l2);
 
